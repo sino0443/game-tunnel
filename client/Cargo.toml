@@ -1,0 +1,22 @@
+[package]
+name = "game-tunnel-client"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+axum = "0.8"
+game-tunnel-shared = { path = "../shared" }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+toml = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+sqlx = { workspace = true }
+reqwest = { workspace = true }
+chrono = { workspace = true }
+uuid = { workspace = true }
+tokio-rustls = { workspace = true }
+rustls-pemfile = { workspace = true }
+socket2 = { version = "0.5", features = ["all"] }

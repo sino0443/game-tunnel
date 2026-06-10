@@ -1,0 +1,516 @@
+<!DOCTYPE html>
+<html lang="de">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Game Tunnel Manager</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; background: #1a1a2e; color: #eee; padding: 20px; }
+        h1 { color: #00d4ff; margin-bottom: 20px; }
+        .container { max-width: 1400px; margin: 0 auto; }
+        .btn { padding: 8px 16px; border: none; border-radius: 6px; cursor: pointer; font-size: 14px; font-weight: 500; transition: opacity 0.2s; }
+        .btn:hover { opacity: 0.8; }
+        .btn-primary { background: #00d4ff; color: #000; }
+        .btn-success { background: #00c853; color: #000; }
+        .btn-danger { background: #ff1744; color: #fff; }
+        .btn-warning { background: #ff9100; color: #000; }
+        .btn-sm { padding: 5px 10px; font-size: 12px; }
+        table { width: 100%; border-collapse: collapse; margin-top: 15px; }
+        th, td { padding: 10px 12px; text-align: left; border-bottom: 1px solid #333; }
+        th { background: #16213e; color: #00d4ff; }
+        tr:hover { background: #16213e; }
+        .status-online { color: #00c853; font-weight: bold; }
+        .status-offline { color: #ff1744; font-weight: bold; }
+        .section-header { background: #0f3460; padding: 8px 12px; margin-top: 20px; border-radius: 6px; font-size: 13px; color: #00d4ff; font-weight: bold; }
+        .modal { display: none; position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.7); z-index: 100; }
+        .modal.active { display: flex; align-items: center; justify-content: center; }
+        .modal-content { background: #16213e; padding: 30px; border-radius: 12px; width: 520px; max-width: 90%; max-height: 90vh; overflow-y: auto; }
+        .modal-content h2 { margin-bottom: 20px; color: #00d4ff; }
+        .form-group { margin-bottom: 15px; }
+        .form-group label { display: block; margin-bottom: 5px; color: #aaa; font-size: 13px; }
+        .form-group input, .form-group select { width: 100%; padding: 10px; border: 1px solid #333; border-radius: 6px; background: #0f3460; color: #eee; font-size: 14px; }
+        .form-actions { display: flex; gap: 10px; margin-top: 20px; }
+        .toolbar { display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px; }
+        .info { color: #aaa; font-size: 14px; }
+        .tabs { display: flex; gap: 0; margin-bottom: 20px; border-bottom: 2px solid #333; }
+        .tab { padding: 12px 24px; cursor: pointer; color: #aaa; font-weight: 500; border-bottom: 2px solid transparent; margin-bottom: -2px; transition: all 0.2s; }
+        .tab:hover { color: #eee; }
+        .tab.active { color: #00d4ff; border-bottom-color: #00d4ff; }
+        .tab-content { display: none; }
+        .tab-content.active { display: block; }
+        .stats-panel { display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap: 15px; margin-bottom: 20px; }
+        .stat-card { background: #16213e; border-radius: 10px; padding: 20px; text-align: center; }
+        .stat-card .value { font-size: 26px; font-weight: bold; color: #00d4ff; }
+        .stat-card .label { font-size: 12px; color: #aaa; margin-top: 5px; }
+        .speed-up { color: #00c853; }
+        .speed-down { color: #00d4ff; }
+        .client-cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 15px; margin-bottom: 25px; }
+        .client-card { background: #16213e; border-radius: 10px; padding: 20px; border-left: 4px solid #333; }
+        .client-card.reachable { border-left-color: #00c853; }
+        .client-card.unreachable { border-left-color: #ff1744; }
+        .client-card h3 { color: #eee; margin-bottom: 6px; font-size: 15px; display: flex; align-items: center; gap: 8px; }
+        .client-card .client-id { color: #888; font-size: 11px; font-family: monospace; margin-bottom: 10px; }
+        .client-card .client-stats { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-top: 10px; }
+        .client-stat { background: #0f3460; border-radius: 6px; padding: 8px; text-align: center; }
+        .client-stat .val { font-size: 15px; font-weight: bold; }
+        .client-stat .lbl { font-size: 10px; color: #888; margin-top: 2px; }
+        .badge { padding: 2px 8px; border-radius: 10px; font-size: 11px; font-weight: bold; }
+        .badge-green { background: #1b5e20; color: #a5d6a7; }
+        .badge-red { background: #b71c1c; color: #ef9a9a; }
+        .tunnel-stat-card { background: #16213e; border-radius: 10px; padding: 20px; margin-bottom: 15px; }
+        .tunnel-stat-card h3 { color: #00d4ff; margin-bottom: 10px; font-size: 14px; }
+        .tunnel-stat-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(130px, 1fr)); gap: 8px; }
+        .tunnel-stat-item { background: #0f3460; border-radius: 6px; padding: 10px; text-align: center; }
+        .tunnel-stat-item .value { font-size: 16px; font-weight: bold; }
+        .tunnel-stat-item .label { font-size: 10px; color: #888; margin-top: 2px; }
+        .server-status-card { background: #16213e; border-radius: 10px; padding: 20px; margin-bottom: 15px; border-left: 4px solid #333; }
+        .server-status-card.connected { border-left-color: #00c853; }
+        .server-status-card.disconnected { border-left-color: #ff1744; }
+        .server-status-card h3 { color: #eee; margin-bottom: 8px; font-size: 16px; display: flex; align-items: center; gap: 10px; }
+        .server-status-card .server-addr { color: #888; font-size: 12px; font-family: monospace; margin-bottom: 14px; }
+        .server-checks { display: flex; gap: 10px; flex-wrap: wrap; margin-bottom: 14px; }
+        .check { padding: 4px 12px; border-radius: 12px; font-size: 12px; font-weight: bold; }
+        .check.ok { background: #1b5e20; color: #a5d6a7; }
+        .check.fail { background: #b71c1c; color: #ef9a9a; }
+        .server-tunnel-list { margin-top: 10px; }
+        .server-tunnel-list table { margin-top: 8px; }
+    </style>
+</head>
+<body>
+<div class="container">
+    <h1>Game Tunnel Manager</h1>
+
+    <div class="tabs">
+        <div class="tab active" onclick="switchTab('tunnels', this)">Tunnels</div>
+        <div class="tab" onclick="switchTab('servers', this)">Server</div>
+        <div class="tab" onclick="switchTab('monitoring', this)">Monitoring</div>
+    </div>
+
+    <div class="tab-content active" id="tab-tunnels">
+        <div class="toolbar">
+            <div class="info" id="tunnel-count">Lade...</div>
+            <button class="btn btn-primary" onclick="showCreateModal()">+ Neuer Tunnel</button>
+        </div>
+        <div id="tunnel-sections"></div>
+    </div>
+
+    <div class="tab-content" id="tab-servers">
+        <h2 style="color:#00d4ff; font-size:14px; margin-bottom:15px;">VPS Server Status</h2>
+        <div id="server-status-list"><div style="color:#888">Lade...</div></div>
+    </div>
+
+    <div class="tab-content" id="tab-monitoring">
+        <div class="stats-panel">
+            <div class="stat-card"><div class="value" id="s-tunnels">-</div><div class="label">Tunnels Online</div></div>
+            <div class="stat-card"><div class="value" id="s-connections">-</div><div class="label">Aktive Verbindungen</div></div>
+            <div class="stat-card"><div class="value speed-down" id="s-bps-in">-</div><div class="label">Download/s</div></div>
+            <div class="stat-card"><div class="value speed-up" id="s-bps-out">-</div><div class="label">Upload/s</div></div>
+            <div class="stat-card"><div class="value" id="s-bytes-in">-</div><div class="label">Total Download</div></div>
+            <div class="stat-card"><div class="value" id="s-bytes-out">-</div><div class="label">Total Upload</div></div>
+        </div>
+        <h2 style="color:#00d4ff; font-size:14px; margin-bottom:12px;">Clients</h2>
+        <div class="client-cards" id="client-cards"><div style="color:#888">Lade...</div></div>
+        <h2 style="color:#00d4ff; font-size:14px; margin-bottom:12px; margin-top:10px;">Tunnel Details</h2>
+        <div id="tunnel-stats-list"></div>
+    </div>
+</div>
+
+<div class="modal" id="modal">
+    <div class="modal-content">
+        <h2 id="modal-title">Neuer Tunnel</h2>
+        <input type="hidden" id="edit-id">
+        <div class="form-group"><label>Name</label><input type="text" id="f-name" placeholder="z.B. Survival Server"></div>
+        <div class="form-group"><label>Subdomain</label><input type="text" id="f-subdomain" placeholder="z.B. survival"></div>
+        <div class="form-group"><label>Domain</label><select id="f-domain"></select></div>
+        <div class="form-group"><label>Server IP (lokal)</label><input type="text" id="f-server-ip" value="127.0.0.1"></div>
+        <div class="form-group"><label>Server Port (lokal)</label><input type="number" id="f-server-port" value="25565"></div>
+        <div class="form-group"><label>Remote Port (VPS)</label><input type="number" id="f-remote-port" value="25565"></div>
+        <div class="form-group"><label>Protokoll</label>
+            <select id="f-protocol">
+                <option value="tcp">TCP</option>
+                <option value="udp">UDP</option>
+                <option value="both">Beide (TCP + UDP)</option>
+            </select>
+        </div>
+        <div class="form-group"><label>VPS Server</label><select id="f-server-id"><option value="">Auto</option></select></div>
+        <div class="form-group"><label>Client (Zuweisung)</label>
+            <select id="f-client-id"><option value="">Auto (Manager entscheidet)</option></select>
+        </div>
+        <div class="form-group" style="display:flex; align-items:center; gap:10px;">
+            <input type="checkbox" id="f-create-srv" checked style="width:auto; cursor:pointer;">
+            <label for="f-create-srv" style="margin:0; cursor:pointer;">SRV Record erstellen (_minecraft._tcp)</label>
+        </div>
+        <div class="form-actions">
+            <button class="btn btn-primary" onclick="saveTunnel()">Speichern</button>
+            <button class="btn btn-danger" onclick="closeModal()">Abbrechen</button>
+        </div>
+    </div>
+</div>
+
+<script>
+const API = '';
+let availableDomains = [];
+let availableServers = [];
+let availableClients = [];
+
+function switchTab(tab, el) {
+    document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+    document.querySelectorAll('.tab-content').forEach(t => t.classList.remove('active'));
+    document.getElementById(`tab-${tab}`).classList.add('active');
+    el.classList.add('active');
+}
+
+function formatBytes(b) {
+    b = Math.round(b);
+    if (b < 1024) return b + ' B';
+    if (b < 1048576) return (b/1024).toFixed(1) + ' KB';
+    if (b < 1073741824) return (b/1048576).toFixed(1) + ' MB';
+    return (b/1073741824).toFixed(2) + ' GB';
+}
+function formatSpeed(bps) {
+    bps = Math.round(bps || 0);
+    if (bps < 1024) return bps + ' B/s';
+    if (bps < 1048576) return (bps/1024).toFixed(1) + ' KB/s';
+    if (bps < 1073741824) return (bps/1048576).toFixed(2) + ' MB/s';
+    return (bps/1073741824).toFixed(2) + ' GB/s';
+}
+function formatUptime(s) {
+    const d = Math.floor(s/86400), h = Math.floor((s%86400)/3600), m = Math.floor((s%3600)/60);
+    if (d > 0) return `${d}d ${h}h ${m}m`;
+    if (h > 0) return `${h}h ${m}m`;
+    return `${m}m ${s%60}s`;
+}
+function clientName(id) {
+    if (!id) return 'Auto';
+    const c = Array.isArray(availableClients) ? availableClients.find(c => c.id === id) : null;
+    return c ? c.name : id;
+}
+function serverName(id) {
+    if (!id && id !== 0) return 'Auto';
+    const s = availableServers.find(s => s.id === id);
+    return s ? s.name : `VPS ${id}`;
+}
+
+async function loadDomains() {
+    try {
+        availableDomains = await (await fetch(`${API}/api/domains`)).json();
+        document.getElementById('f-domain').innerHTML = availableDomains.map(d => `<option value="${d}">${d}</option>`).join('');
+    } catch(e) {}
+}
+
+async function loadServers() {
+    try {
+        availableServers = await (await fetch(`${API}/api/servers`)).json();
+        const sel = document.getElementById('f-server-id');
+        sel.innerHTML = '<option value="">Auto</option>';
+        availableServers.forEach(s => sel.innerHTML += `<option value="${s.id}">${s.name}</option>`);
+    } catch(e) {}
+}
+
+async function loadClients() {
+    try {
+        const data = await (await fetch(`${API}/api/clients`)).json();
+        if (Array.isArray(data)) availableClients = data;
+        if (document.getElementById('modal').classList.contains('active')) return;
+        const sel = document.getElementById('f-client-id');
+        sel.innerHTML = '<option value="">Auto (Manager entscheidet)</option>';
+        availableClients.forEach(c => sel.innerHTML += `<option value="${c.id}">${c.name} (${c.id})</option>`);
+    } catch(e) {}
+}
+
+async function loadStats() {
+    let s;
+    try {
+        s = await (await fetch(`${API}/api/stats`)).json();
+    } catch(e) {
+        document.getElementById('s-tunnels').textContent = 'Offline';
+        document.getElementById('client-cards').innerHTML = '<div style="color:#ff1744">Manager nicht erreichbar</div>';
+        document.getElementById('server-status-list').innerHTML = '<div style="color:#ff1744">Manager nicht erreichbar</div>';
+        return;
+    }
+
+    if (s.error) {
+        document.getElementById('s-tunnels').textContent = 'N/A';
+        document.getElementById('server-status-list').innerHTML = '<div style="color:#ff9100">Manager URL nicht konfiguriert</div>';
+        return;
+    }
+
+    // ── Monitoring Tab: globale Stats ──────────────────────────────────────
+    document.getElementById('s-tunnels').textContent = `${s.online_tunnels} / ${s.total_tunnels}`;
+    document.getElementById('s-connections').textContent = s.total_active_connections ?? 0;
+    document.getElementById('s-bps-in').textContent = formatSpeed(s.total_bytes_out_per_sec);
+    document.getElementById('s-bps-out').textContent = formatSpeed(s.total_bytes_in_per_sec);
+    document.getElementById('s-bytes-in').textContent = formatBytes(s.total_bytes_out ?? 0);
+    document.getElementById('s-bytes-out').textContent = formatBytes(s.total_bytes_in ?? 0);
+
+    // ── Clients ────────────────────────────────────────────────────────────
+    if (s.clients && s.clients.length > 0) {
+        document.getElementById('client-cards').innerHTML = s.clients.map(c => `
+            <div class="client-card ${c.reachable ? 'reachable' : 'unreachable'}">
+                <h3>${c.name}
+                    <span class="badge ${c.reachable ? 'badge-green' : 'badge-red'}">${c.reachable ? 'Online' : 'Offline'}</span>
+                </h3>
+                <div class="client-id">${c.id} · ${c.stats_url}</div>
+                ${c.reachable ? `
+                <div class="client-stats">
+                    <div class="client-stat"><div class="val">${c.tunnel_count}</div><div class="lbl">Tunnels</div></div>
+                    <div class="client-stat"><div class="val">${c.active_connections}</div><div class="lbl">Verbindungen</div></div>
+                    <div class="client-stat"><div class="val speed-down">${formatSpeed(c.bytes_out_per_sec)}</div><div class="lbl">Download/s</div></div>
+                    <div class="client-stat"><div class="val speed-up">${formatSpeed(c.bytes_in_per_sec)}</div><div class="lbl">Upload/s</div></div>
+                    <div class="client-stat"><div class="val">${formatBytes(c.total_bytes_out)}</div><div class="lbl">Total Down</div></div>
+                    <div class="client-stat"><div class="val">${formatUptime(c.uptime_secs)}</div><div class="lbl">Uptime</div></div>
+                </div>` : '<div style="color:#888; font-size:13px; margin-top:10px;">Client nicht erreichbar</div>'}
+            </div>
+        `).join('');
+    } else {
+        document.getElementById('client-cards').innerHTML = '<div style="color:#888">Keine Clients konfiguriert</div>';
+    }
+
+    // ── Tunnel Details: alle Tunnel anzeigen (online UND offline) ──────────
+    const allTunnels = s.tunnels || [];
+    const active  = allTunnels.filter(t => t.active_connections > 0 || t.bytes_in_per_sec > 0 || t.bytes_out_per_sec > 0);
+    const idle    = allTunnels.filter(t => t.online && t.active_connections === 0 && t.bytes_in_per_sec === 0 && t.bytes_out_per_sec === 0);
+    const offline = allTunnels.filter(t => !t.online);
+
+    let statsHtml = '';
+    if (allTunnels.length === 0) {
+        statsHtml = '<p style="color:#888">Keine Tunnel vorhanden</p>';
+    } else {
+        // Aktive Tunnel: volles Stats-Grid
+        statsHtml += active.map(t => `
+            <div class="tunnel-stat-card">
+                <h3>${t.name || t.subdomain}
+                    <span style="color:#888; font-size:11px; font-weight:normal; margin-left:8px;">${clientName(t.client_id)}</span>
+                </h3>
+                <div class="tunnel-stat-grid">
+                    <div class="tunnel-stat-item"><div class="value speed-down">${formatSpeed(t.bytes_out_per_sec)}</div><div class="label">Download/s</div></div>
+                    <div class="tunnel-stat-item"><div class="value speed-up">${formatSpeed(t.bytes_in_per_sec)}</div><div class="label">Upload/s</div></div>
+                    <div class="tunnel-stat-item"><div class="value">${formatBytes(t.bytes_out)}</div><div class="label">Total Down</div></div>
+                    <div class="tunnel-stat-item"><div class="value">${formatBytes(t.bytes_in)}</div><div class="label">Total Up</div></div>
+                    <div class="tunnel-stat-item"><div class="value">${t.active_connections}</div><div class="label">Verbindungen</div></div>
+                    <div class="tunnel-stat-item"><div class="value" style="font-size:12px">${t.tunnel_status}</div><div class="label">Status</div></div>
+                </div>
+            </div>
+        `).join('');
+
+        // Online idle + Offline: kompakte Tabelle
+        const tableRows = [...idle, ...offline];
+        if (tableRows.length > 0) {
+            if (active.length > 0) {
+                statsHtml += `<div style="color:#888; font-size:12px; margin:14px 0 6px;">Weitere Tunnel (${tableRows.length})</div>`;
+            }
+            statsHtml += `<table><thead><tr>
+                <th>Name</th><th>Subdomain</th><th>Client</th>
+                <th>Status</th><th>Verbindungen</th><th>Total Down</th><th>Total Up</th>
+            </tr></thead><tbody>`;
+            statsHtml += tableRows.map(t => `<tr>
+                <td><strong>${t.name || t.subdomain}</strong></td>
+                <td style="font-size:11px;color:#aaa">${t.subdomain}.${t.domain}</td>
+                <td style="font-size:11px;color:#aaa">${clientName(t.client_id)}</td>
+                <td class="${t.online ? 'status-online' : 'status-offline'}">${t.online ? t.tunnel_status || 'idle' : 'offline'}</td>
+                <td>${t.active_connections}</td>
+                <td>${formatBytes(t.bytes_out)}</td>
+                <td>${formatBytes(t.bytes_in)}</td>
+            </tr>`).join('');
+            statsHtml += `</tbody></table>`;
+        }
+    }
+    document.getElementById('tunnel-stats-list').innerHTML = statsHtml;
+
+    // ── Server Tab ─────────────────────────────────────────────────────────
+    const tunnelsByServer = {};
+    allTunnels.forEach(t => {
+        const key = t.server_id != null ? t.server_id : 'auto';
+        if (!tunnelsByServer[key]) tunnelsByServer[key] = [];
+        tunnelsByServer[key].push(t);
+    });
+
+    // Versuche zuerst Live-Daten von Clients (TLS/Auth/Connected-Status)
+    const allServers = {};
+    (s.clients || []).forEach(c => {
+        (c.servers || []).forEach(srv => {
+            if (!allServers[srv.id]) allServers[srv.id] = { id: srv.id, name: srv.name, address: srv.address, entries: [] };
+            allServers[srv.id].entries.push({ client: c, connected: srv.connected, tls_ok: srv.tls_ok, auth_ok: srv.auth_ok });
+        });
+    });
+
+    let serverHtml = '';
+    if (Object.keys(allServers).length > 0) {
+        // Volle Server-Ansicht mit Verbindungsstatus vom Client
+        Object.values(allServers).forEach(server => {
+            const isAnyConnected = server.entries.some(e => e.connected);
+            const tunnels = tunnelsByServer[server.id] || [];
+            serverHtml += `<div class="server-status-card ${isAnyConnected ? 'connected' : 'disconnected'}">
+                <h3>${server.name || `Server ${server.id}`}
+                    <span class="badge ${isAnyConnected ? 'badge-green' : 'badge-red'}">${isAnyConnected ? 'Verbunden' : 'Getrennt'}</span>
+                </h3>
+                <div class="server-addr">${server.address || ''}</div>
+                <div class="server-checks">`;
+            server.entries.forEach(e => {
+                serverHtml += `
+                    <span class="check ${e.tls_ok ? 'ok' : 'fail'}">TLS ${e.tls_ok ? '✓' : '✗'}</span>
+                    <span class="check ${e.auth_ok ? 'ok' : 'fail'}">Auth ${e.auth_ok ? '✓' : '✗'}</span>
+                    <span style="color:#666;font-size:11px;align-self:center">via ${e.client.name}</span>`;
+            });
+            serverHtml += `</div>`;
+            serverHtml += renderServerTunnelTable(tunnels);
+            serverHtml += `</div>`;
+        });
+    } else {
+        // Fallback: Tunnel aus Manager-Stats nach server_id gruppieren
+        const groups = {};
+        allTunnels.forEach(t => {
+            const sid = t.server_id != null ? t.server_id : 'auto';
+            if (!groups[sid]) {
+                const srv = availableServers.find(s => s.id === t.server_id);
+                groups[sid] = {
+                    name: srv ? srv.name : (t.server_id != null ? `VPS ${t.server_id}` : 'Kein Server zugewiesen'),
+                    tunnels: []
+                };
+            }
+            groups[sid].tunnels.push(t);
+        });
+
+        if (Object.keys(groups).length === 0) {
+            serverHtml = '<div style="color:#888">Keine Tunnel vorhanden</div>';
+        } else {
+            Object.values(groups).forEach(group => {
+                serverHtml += `<div class="server-status-card">
+                    <h3>${group.name}</h3>`;
+                serverHtml += renderServerTunnelTable(group.tunnels);
+                serverHtml += `</div>`;
+            });
+        }
+    }
+    document.getElementById('server-status-list').innerHTML = serverHtml;
+}
+
+function renderServerTunnelTable(tunnels) {
+    if (tunnels.length === 0) return '<div style="color:#888; font-size:12px;">Keine Tunnel auf diesem Server</div>';
+    let html = `<div class="server-tunnel-list">
+        <div style="color:#aaa; font-size:12px; margin-bottom:6px;">${tunnels.length} Tunnel:</div>
+        <table><thead><tr>
+            <th>Name</th><th>Port</th><th>Status</th><th>Verbindungen</th><th>Down/s</th><th>Up/s</th>
+        </tr></thead><tbody>`;
+    tunnels.forEach(t => {
+        html += `<tr>
+            <td><strong>${t.name || t.subdomain}</strong></td>
+            <td>${t.remote_port}</td>
+            <td class="${t.online ? 'status-online' : 'status-offline'}">${t.tunnel_status || (t.online ? 'idle' : 'stopped')}</td>
+            <td>${t.active_connections}</td>
+            <td class="speed-down">${formatSpeed(t.bytes_out_per_sec)}</td>
+            <td class="speed-up">${formatSpeed(t.bytes_in_per_sec)}</td>
+        </tr>`;
+    });
+    html += `</tbody></table></div>`;
+    return html;
+}
+
+async function loadTunnels() {
+    try { renderTunnels(await (await fetch(`${API}/api/tunnels`)).json()); }
+    catch(e) { document.getElementById('tunnel-count').textContent = 'Fehler'; }
+}
+
+function renderTunnels(tunnels) {
+    const online = tunnels.filter(t => t.online).length;
+    document.getElementById('tunnel-count').textContent = `${tunnels.length} Tunnel (${online} online)`;
+    const groups = { tcp: [], udp: [], both: [] };
+    tunnels.forEach(t => { const p = t.protocol.toLowerCase(); if (groups[p]) groups[p].push(t); else groups.tcp.push(t); });
+    let html = '';
+    const labels = { tcp: 'TCP', udp: 'UDP', both: 'TCP + UDP' };
+    for (const [proto, list] of Object.entries(groups)) {
+        if (list.length === 0) continue;
+        html += `<div class="section-header">${labels[proto]} (${list.length})</div>`;
+        html += `<table><thead><tr><th>ID</th><th>Name</th><th>Subdomain</th><th>Lokal</th><th>Port</th><th>VPS</th><th>Client</th><th>Status</th><th>Tunnel</th><th>Aktionen</th></tr></thead><tbody>`;
+        list.forEach(t => {
+            html += `<tr>
+                <td>${t.id}</td>
+                <td><strong>${t.name || '-'}</strong></td>
+                <td>${t.subdomain}.${t.domain}</td>
+                <td>${t.server_ip}:${t.server_port}</td>
+                <td>${t.remote_port}</td>
+                <td style="font-size:12px;color:#aaa">${serverName(t.server_id)}</td>
+                <td style="font-size:12px;color:#aaa">${clientName(t.client_id)}</td>
+                <td class="${t.online ? 'status-online' : 'status-offline'}">${t.online ? 'ONLINE' : 'OFFLINE'}</td>
+                <td style="font-size:11px;color:#888">${t.tunnel_status || '-'}</td>
+                <td>
+                    ${t.online
+                        ? `<button class="btn btn-warning btn-sm" onclick="stopTunnel(${t.id})">Stop</button>`
+                        : `<button class="btn btn-success btn-sm" onclick="startTunnel(${t.id})">Start</button>`}
+                    <button class="btn btn-primary btn-sm" onclick="editTunnel(${t.id})">Edit</button>
+                    <button class="btn btn-danger btn-sm" onclick="deleteTunnel(${t.id}, '${t.subdomain}')">Delete</button>
+                </td>
+            </tr>`;
+        });
+        html += `</tbody></table>`;
+    }
+    document.getElementById('tunnel-sections').innerHTML = html;
+}
+
+function showCreateModal() {
+    document.getElementById('modal-title').textContent = 'Neuer Tunnel';
+    document.getElementById('edit-id').value = '';
+    document.getElementById('f-name').value = '';
+    document.getElementById('f-subdomain').value = '';
+    document.getElementById('f-domain').value = availableDomains[0] || '';
+    document.getElementById('f-server-ip').value = '127.0.0.1';
+    document.getElementById('f-server-port').value = '25565';
+    document.getElementById('f-remote-port').value = '25565';
+    document.getElementById('f-protocol').value = 'tcp';
+    document.getElementById('f-server-id').value = '';
+    document.getElementById('f-client-id').value = '';
+    document.getElementById('f-create-srv').checked = true;
+    document.getElementById('modal').classList.add('active');
+}
+
+async function editTunnel(id) {
+    const t = await (await fetch(`${API}/api/tunnels/${id}`)).json();
+    document.getElementById('modal-title').textContent = 'Tunnel bearbeiten';
+    document.getElementById('edit-id').value = id;
+    document.getElementById('f-name').value = t.name || '';
+    document.getElementById('f-subdomain').value = t.subdomain;
+    document.getElementById('f-domain').value = t.domain;
+    document.getElementById('f-server-ip').value = t.server_ip;
+    document.getElementById('f-server-port').value = t.server_port;
+    document.getElementById('f-remote-port').value = t.remote_port;
+    document.getElementById('f-protocol').value = t.protocol;
+    document.getElementById('f-server-id').value = t.server_id || '';
+    document.getElementById('f-client-id').value = t.client_id || '';
+    document.getElementById('f-create-srv').checked = t.create_srv !== false;
+    document.getElementById('modal').classList.add('active');
+}
+
+function closeModal() { document.getElementById('modal').classList.remove('active'); }
+
+async function saveTunnel() {
+    const id = document.getElementById('edit-id').value;
+    const clientIdVal = document.getElementById('f-client-id').value;
+    const serverIdVal = document.getElementById('f-server-id').value;
+    const data = {
+        name: document.getElementById('f-name').value,
+        subdomain: document.getElementById('f-subdomain').value,
+        domain: document.getElementById('f-domain').value,
+        server_ip: document.getElementById('f-server-ip').value,
+        server_port: parseInt(document.getElementById('f-server-port').value),
+        remote_port: parseInt(document.getElementById('f-remote-port').value),
+        protocol: document.getElementById('f-protocol').value,
+        server_id: serverIdVal ? parseInt(serverIdVal) : null,
+        client_id: clientIdVal || null,
+        create_srv: document.getElementById('f-create-srv').checked,
+    };
+    if (id) { await fetch(`${API}/api/tunnels/${id}`, { method: 'PUT', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(data) }); }
+    else { await fetch(`${API}/api/tunnels`, { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(data) }); }
+    closeModal(); loadTunnels();
+}
+
+async function startTunnel(id) { await fetch(`${API}/api/tunnels/${id}/start`, { method: 'POST' }); loadTunnels(); }
+async function stopTunnel(id) { await fetch(`${API}/api/tunnels/${id}/stop`, { method: 'POST' }); loadTunnels(); }
+async function deleteTunnel(id, name) { if (!confirm(`"${name}" löschen?`)) return; await fetch(`${API}/api/tunnels/${id}`, { method: 'DELETE' }); loadTunnels(); }
+
+loadDomains(); loadServers(); loadClients(); loadTunnels(); loadStats();
+
+setInterval(() => { loadTunnels(); loadClients(); loadStats(); }, 500);
+</script>
+</body>
+</html>
