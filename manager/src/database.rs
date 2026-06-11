@@ -18,7 +18,7 @@ pub async fn ensure_columns(pool: &MySqlPool) -> Result<()> {
         ("dns_set", "BOOLEAN NOT NULL DEFAULT FALSE"),
     ];
     for (col, def) in &columns {
-        let sql = format!("ALTER TABLE tunnels ADD COLUMN IF NOT EXISTS {} {}", col, def);
+        let sql = format!("ALTER TABLE tunnels ADD COLUMN {} {}", col, def);
         if let Err(e) = sqlx::query(&sql).execute(pool).await {
             if !e.to_string().contains("Duplicate column") { warn!("Column check {}: {:?}", col, e); }
         }
@@ -141,6 +141,159 @@ pub async fn get_assigned_tunnels_for_dns(pool: &MySqlPool) -> Result<Vec<DnsTun
         server_id: r.try_get::<Option<u32>, _>("server_id").unwrap_or(None),
         create_srv: r.try_get("create_srv").unwrap_or(true),
     }).collect())
+}
+
+// ── client_server_mappings ──────────────────────────────────────────────────
+
+/// Creates the `client_server_mappings` table if it does not yet exist.
+/// Call once at startup after `ensure_columns`.
+pub async fn ensure_client_server_table(pool: &MySqlPool) -> Result<()> {
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS client_server_mappings (
+            id          INT AUTO_INCREMENT PRIMARY KEY,
+            client_uuid VARCHAR(36)  NOT NULL,
+            client_id   VARCHAR(50)  NOT NULL,
+            server_id   INT          NOT NULL,
+            allowed     BOOLEAN      NOT NULL DEFAULT TRUE,
+            created_at  DATETIME     NOT NULL DEFAULT NOW(),
+            updated_at  DATETIME     NOT NULL DEFAULT NOW() ON UPDATE NOW(),
+            UNIQUE KEY  uq_client_uuid (client_uuid),
+            INDEX       idx_csm_server (server_id)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4",
+    )
+    .execute(pool)
+    .await?;
+    info!("client_server_mappings table ensured");
+    Ok(())
+}
+
+pub struct ClientServerMapping {
+    pub client_uuid: String,
+    pub client_id: String,
+    pub server_id: u32,
+    pub allowed: bool,
+}
+
+/// Returns the server mapping for a given client UUID, if one exists.
+pub async fn get_server_for_client_uuid(
+    pool: &MySqlPool,
+    client_uuid: &str,
+) -> Result<Option<ClientServerMapping>> {
+    let row = sqlx::query(
+        "SELECT client_uuid, client_id, server_id, allowed
+         FROM client_server_mappings
+         WHERE client_uuid = ?",
+    )
+    .bind(client_uuid)
+    .fetch_optional(pool)
+    .await?;
+
+    if let Some(r) = row {
+        // 1. Als i32 auslesen (das matcht exakt mit dem MySQL INT-Typ)
+        let server_id_signed = r.try_get::<i32, _>("server_id").unwrap_or(0);
+        
+        // 2. Sicher in u32 konvertieren (falls negativ, wird es 0)
+        let server_id = if server_id_signed >= 0 {
+            server_id_signed as u32
+        } else {
+            0
+        };
+
+        Ok(Some(ClientServerMapping {
+            client_uuid: r.try_get("client_uuid").unwrap_or_default(),
+            client_id:   r.try_get("client_id").unwrap_or_default(),
+            server_id,
+            allowed:     r.try_get("allowed").unwrap_or(false),
+        }))
+    } else {
+        Ok(None)
+    }
+}
+
+
+
+/// Returns ALL distinct server_ids that have at least one tunnel assigned
+/// to `client_id`.  Used by the multi-server endpoint so the client can
+/// connect to every server that has tunnels waiting for it.
+pub async fn get_servers_for_client(
+    pool: &MySqlPool,
+    client_id: &str,
+) -> Result<Vec<u32>> {
+    // CAST(server_id AS UNSIGNED) forces MySQL to return UNSIGNED BIGINT,
+    // which sqlx maps unambiguously to u64 regardless of how tunnels.server_id
+    // is declared (INT, INT UNSIGNED, TINYINT, …).
+    let rows: Vec<u64> = sqlx::query_scalar(
+        "SELECT DISTINCT CAST(server_id AS UNSIGNED)
+         FROM   tunnels
+         WHERE  client_id = ? AND server_id IS NOT NULL
+         ORDER  BY server_id ASC",
+    )
+    .bind(client_id)
+    .fetch_all(pool)
+    .await?;
+
+    let result: Vec<u32> = rows.into_iter().filter(|&s| s > 0).map(|s| s as u32).collect();
+    tracing::debug!("get_servers_for_client({:?}) → {:?}", client_id, result);
+    Ok(result)
+}
+
+/// Returns the server_id that has the most tunnels assigned to a given
+/// client_id.  Only considers tunnels where server_id IS NOT NULL.
+/// Returns None when the client has no such tunnels.
+pub async fn get_best_server_for_client(
+    pool: &MySqlPool,
+    client_id: &str,
+) -> Result<Option<u32>> {
+    let sid: Option<u64> = sqlx::query_scalar(
+        "SELECT CAST(server_id AS UNSIGNED)
+         FROM   tunnels
+         WHERE  client_id = ? AND server_id IS NOT NULL
+         GROUP  BY server_id
+         ORDER  BY COUNT(*) DESC, server_id ASC
+         LIMIT  1",
+    )
+    .bind(client_id)
+    .fetch_optional(pool)
+    .await?;
+
+    Ok(match sid {
+        Some(s) if s > 0 => Some(s as u32),
+        _ => None,
+    })
+}
+
+/// Upserts a row in `client_server_mappings`.
+///
+/// On first insert the `allowed` flag is set to TRUE.
+/// On duplicate key (same `client_uuid`) only `client_id`, `server_id`,
+/// and `updated_at` are refreshed — `allowed` is intentionally left
+/// untouched so that manual bans survive automatic syncs.
+///
+/// Returns `true` when a row was inserted or changed, `false` when the
+/// existing row already had the same values.
+pub async fn upsert_client_server_mapping(
+    pool: &MySqlPool,
+    client_uuid: &str,
+    client_id: &str,
+    server_id: u32,
+) -> Result<bool> {
+    let res = sqlx::query(
+        "INSERT INTO client_server_mappings
+             (client_uuid, client_id, server_id, allowed)
+         VALUES (?, ?, ?, TRUE)
+         ON DUPLICATE KEY UPDATE
+             client_id  = VALUES(client_id),
+             server_id  = VALUES(server_id),
+             updated_at = NOW()",
+    )
+    .bind(client_uuid)
+    .bind(client_id)
+    .bind(server_id as i32)
+    .execute(pool)
+    .await?;
+
+    // MySQL ON DUPLICATE KEY: 1 = inserted, 2 = updated, 0 = no change.
+    Ok(res.rows_affected() >= 1)
 }
 
 pub struct TunnelRow {
