@@ -131,7 +131,7 @@ async fn main() -> Result<()> {
         .route("/api/tunnels", get(get_tunnels))
         .route("/api/clients", get(get_clients))
         // Client asks manager: "which server should I connect to?"
-        .route("/api/client/:uuid/server", get(get_server_for_client))
+        .route("/api/client/{uuid}/server", get(get_server_for_client))
         .layer(CorsLayer::permissive())
         .with_state(state);
 
