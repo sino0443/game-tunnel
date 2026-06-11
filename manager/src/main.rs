@@ -1,7 +1,8 @@
 use anyhow::{Context, Result};
 
 use axum::Router;
-use axum::extract::State;
+use axum::extract::{Path, State};
+use axum::http::StatusCode;
 use axum::response::{IntoResponse, Json};
 use axum::routing::get;
 use game_tunnel_shared::config::{CloudflareConfig, ManagerConfig};
@@ -87,6 +88,7 @@ async fn main() -> Result<()> {
     let pool = database::connect(&config.database).await?;
     info!("Connected to MySQL");
     database::ensure_columns(&pool).await?;
+    database::ensure_client_server_table(&pool).await?;
 
     let http_client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(5))
@@ -128,6 +130,8 @@ async fn main() -> Result<()> {
         .route("/api/stats", get(get_stats))
         .route("/api/tunnels", get(get_tunnels))
         .route("/api/clients", get(get_clients))
+        // Client asks manager: "which server should I connect to?"
+        .route("/api/client/:uuid/server", get(get_server_for_client))
         .layer(CorsLayer::permissive())
         .with_state(state);
 
@@ -343,4 +347,115 @@ async fn get_tunnels(State(state): State<Arc<AppState>>) -> impl IntoResponse {
 
 async fn get_clients(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     Json(state.manager_state.read().await.clients.clone())
+}
+
+// ── Client server-assignment endpoint ───────────────────────────────────────
+
+#[derive(Serialize)]
+struct ServerAssignmentResponse {
+    server_id: u32,
+}
+
+/// `GET /api/client/:uuid/server`
+///
+/// Returns the server_id assigned to the given client UUID.
+///
+/// Before responding, the manager POSTs a pre-auth notification to the
+/// server's management API with a 10-second timeout. If the server does
+/// not acknowledge within 10 seconds, a 503 is returned to the client.
+async fn get_server_for_client(
+    Path(uuid): Path<String>,
+    State(state): State<Arc<AppState>>,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    // 1. Look up the client_server_mappings table.
+    let mapping = database::get_server_for_client_uuid(&state.db, &uuid)
+        .await
+        .map_err(|e| {
+            error!("DB error looking up client UUID {}: {:?}", uuid, e);
+            (StatusCode::INTERNAL_SERVER_ERROR, "database error".to_string())
+        })?;
+
+    let mapping = match mapping {
+        Some(m) if m.allowed => m,
+        Some(_) => {
+            warn!("Client UUID {} is not allowed", uuid);
+            return Err((StatusCode::FORBIDDEN, "client not allowed".to_string()));
+        }
+        None => {
+            warn!("No server mapping found for client UUID {}", uuid);
+            return Err((StatusCode::NOT_FOUND, "no server mapping found".to_string()));
+        }
+    };
+
+    // 2. Find the server's management URL in config.
+    let server_cfg = state.config.servers.iter().find(|s| s.id == mapping.server_id);
+    let mgmt_url = match server_cfg {
+        Some(s) => s.mgmt_url.clone(),
+        None => {
+            error!(
+                "Server id {} from mapping not found in manager config",
+                mapping.server_id
+            );
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "server config not found".to_string(),
+            ));
+        }
+    };
+
+    // 3. Notify the server about the incoming client UUID (10-second timeout).
+    let pre_auth_url = format!("{}/api/manager/pre-auth", mgmt_url.trim_end_matches('/'));
+    let body = serde_json::json!({ "client_uuid": uuid });
+
+    let notify_result = tokio::time::timeout(
+        tokio::time::Duration::from_secs(10),
+        state.http_client.post(&pre_auth_url).json(&body).send(),
+    )
+    .await;
+
+    match notify_result {
+        Err(_) => {
+            warn!(
+                "Pre-auth notification to server {} timed out after 10s for UUID {}",
+                mapping.server_id, uuid
+            );
+            return Err((
+                StatusCode::SERVICE_UNAVAILABLE,
+                "server did not respond to pre-auth in time".to_string(),
+            ));
+        }
+        Ok(Err(e)) => {
+            error!(
+                "Failed to reach server {} mgmt API for pre-auth (UUID {}): {:?}",
+                mapping.server_id, uuid, e
+            );
+            return Err((
+                StatusCode::SERVICE_UNAVAILABLE,
+                "could not reach server management API".to_string(),
+            ));
+        }
+        Ok(Ok(resp)) => {
+            if !resp.status().is_success() {
+                warn!(
+                    "Server {} rejected pre-auth for UUID {}: HTTP {}",
+                    mapping.server_id,
+                    uuid,
+                    resp.status()
+                );
+                return Err((
+                    StatusCode::BAD_GATEWAY,
+                    "server rejected pre-auth".to_string(),
+                ));
+            }
+        }
+    }
+
+    info!(
+        "Pre-auth OK: client UUID {} assigned to server {} (client_id: {})",
+        mapping.client_uuid, mapping.server_id, mapping.client_id
+    );
+
+    Ok(Json(ServerAssignmentResponse {
+        server_id: mapping.server_id,
+    }))
 }
