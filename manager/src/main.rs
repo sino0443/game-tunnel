@@ -573,38 +573,15 @@ async fn get_servers_for_client(
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
-    // Fallback: client has no tunnels with a server_id yet (bootstrap — first connection
-    // before any tunnel has been created / assigned a VPS server).
-    // We do NOT fall back when the client previously had tunnels that were deleted:
-    // in that case we intentionally return [] so the client disconnects from servers
-    // it no longer has any work to do on.
+    // Fallback: no tunnel-based assignments yet → use the mapping row or first server.
     if server_ids.is_empty() {
-        // Count all tunnels for this client (includes stopped/offline ones).
-        // Zero → genuine bootstrap; non-zero means server_id is NULL for all tunnels,
-        // or they were recently deleted — either way, use the fallback to keep the
-        // client reachable so new tunnels can be assigned.
-        let tunnel_count: i64 = sqlx::query_scalar::<_, i64>(
-            "SELECT COUNT(*) FROM tunnels WHERE client_id = ?",
-        )
-        .bind(&client_id)
-        .fetch_one(&state.db)
-        .await
-        .unwrap_or(0);
-
-        if tunnel_count == 0 {
-            // Bootstrap: no tunnels exist yet — fall back to configured server so the
-            // client is ready to receive new tunnel assignments immediately.
-            if let Some(sid) = fallback_server_id {
-                server_ids.push(sid);
-            } else if let Some(s) = state.config.servers.first() {
-                server_ids.push(s.id);
-            } else {
-                return Err((StatusCode::SERVICE_UNAVAILABLE, "no servers configured".to_string()));
-            }
+        if let Some(sid) = fallback_server_id {
+            server_ids.push(sid);
+        } else if let Some(s) = state.config.servers.first() {
+            server_ids.push(s.id);
+        } else {
+            return Err((StatusCode::SERVICE_UNAVAILABLE, "no servers configured".to_string()));
         }
-        // else: tunnels exist (or existed) but none have a known server_id right now.
-        // Return empty list — the client will disconnect and reconnect once tunnel
-        // assignments carry a server_id again.
     }
 
     // 3. Send pre-auth to all servers concurrently (best-effort: we always

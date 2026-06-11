@@ -253,18 +253,6 @@ tbody tr:hover{background:rgba(255,255,255,.025)}
 .toast.err{border-left:3px solid var(--red)}
 @keyframes tIn{from{transform:translateX(110%);opacity:0}to{transform:none;opacity:1}}
 
-/* preset buttons */
-.presets{display:flex;flex-wrap:wrap;gap:6px;margin-bottom:16px}
-.preset-btn{
-  display:flex;align-items:center;gap:6px;
-  padding:5px 11px;border-radius:8px;cursor:pointer;
-  background:var(--bg-input);border:1px solid var(--border);
-  color:var(--text-muted);font-size:12px;font-weight:600;
-  transition:var(--ease);
-}
-.preset-btn:hover{border-color:var(--accent);color:var(--text);background:var(--accent-dim)}
-.preset-btn .pe{font-size:14px}
-
 /* scrollbar */
 ::-webkit-scrollbar{width:5px;height:5px}
 ::-webkit-scrollbar-track{background:transparent}
@@ -413,25 +401,6 @@ tbody tr:hover{background:rgba(255,255,255,.025)}
     </div>
     <div class="mbody">
       <input type="hidden" id="edit-id">
-      <!-- Game presets — only visible when creating a new tunnel -->
-      <div id="preset-section" style="margin-bottom:16px">
-        <div style="font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:.6px;color:var(--text-muted);margin-bottom:8px">Preset</div>
-        <div class="presets">
-          <button class="preset-btn" onclick="applyPreset('Minecraft Java','tcp',25565,true)"  type="button"><span class="pe">⛏️</span>Minecraft Java</button>
-          <button class="preset-btn" onclick="applyPreset('Minecraft Bedrock','udp',19132,false)" type="button"><span class="pe">📱</span>Minecraft Bedrock</button>
-          <button class="preset-btn" onclick="applyPreset('Satisfactory','udp',7777,false)"  type="button"><span class="pe">🏭</span>Satisfactory</button>
-          <button class="preset-btn" onclick="applyPreset('Valheim','udp',2456,false)"       type="button"><span class="pe">🪓</span>Valheim</button>
-          <button class="preset-btn" onclick="applyPreset('ARK','udp',7777,false)"           type="button"><span class="pe">🦕</span>ARK</button>
-          <button class="preset-btn" onclick="applyPreset('CS2','udp',27015,false)"          type="button"><span class="pe">🔫</span>CS2</button>
-          <button class="preset-btn" onclick="applyPreset('Terraria','tcp',7777,false)"      type="button"><span class="pe">🌳</span>Terraria</button>
-          <button class="preset-btn" onclick="applyPreset('FiveM','both',30120,false)"       type="button"><span class="pe">🚗</span>FiveM</button>
-          <button class="preset-btn" onclick="applyPreset('Rust','udp',28015,false)"         type="button"><span class="pe">🔧</span>Rust</button>
-          <button class="preset-btn" onclick="applyPreset('Factorio','udp',34197,false)"     type="button"><span class="pe">⚙️</span>Factorio</button>
-          <button class="preset-btn" onclick="applyPreset('Project Zomboid','udp',16261,false)" type="button"><span class="pe">🧟</span>Project Zomboid</button>
-          <button class="preset-btn" onclick="applyPreset('Webserver','tcp',80,false)"       type="button"><span class="pe">🌐</span>HTTP (80)</button>
-          <button class="preset-btn" onclick="applyPreset('Webserver HTTPS','tcp',443,false)" type="button"><span class="pe">🔒</span>HTTPS (443)</button>
-        </div>
-      </div>
       <div class="frow">
         <div class="fg"><label>Name</label><input id="f-name" placeholder="z.B. Survival Server"></div>
         <div class="fg"><label>Subdomain</label><input id="f-subdomain" placeholder="z.B. survival"></div>
@@ -818,20 +787,9 @@ async function delT(id,name){
 }
 
 // modal
-// ── Game presets ──────────────────────────────────────────────────────────
-function applyPreset(name,proto,port,srv){
-  // Always overwrite — if the user clicks a different preset, all fields update
-  document.getElementById('f-name').value=name;
-  document.getElementById('f-proto').value=proto;
-  document.getElementById('f-sport').value=port;
-  document.getElementById('f-rport').value=port;
-  document.getElementById('f-srv').checked=srv;
-}
-
 function showCreate(){
   document.getElementById('modal-title').textContent='Neuer Tunnel';
   document.getElementById('edit-id').value='';
-  document.getElementById('preset-section').style.display='';
   ['f-name','f-subdomain'].forEach(id=>document.getElementById(id).value='');
   document.getElementById('f-domain').value=domains[0]||'';
   document.getElementById('f-sip').value='127.0.0.1';
@@ -846,7 +804,6 @@ function showCreate(){
 async function editT(id){
   const t=await(await fetch(API+'/api/tunnels/'+id)).json();
   document.getElementById('modal-title').textContent='Tunnel bearbeiten';
-  document.getElementById('preset-section').style.display='none';
   document.getElementById('edit-id').value=id;
   document.getElementById('f-name').value=t.name||'';
   document.getElementById('f-subdomain').value=t.subdomain;
@@ -877,13 +834,8 @@ async function save(){
     client_id:cid||null,
     create_srv:document.getElementById('f-srv').checked,
   };
-  const resp=await fetch(id?API+'/api/tunnels/'+id:API+'/api/tunnels',
+  await fetch(id?API+'/api/tunnels/'+id:API+'/api/tunnels',
     {method:id?'PUT':'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(data)});
-  if(!resp.ok){
-    const msg=await resp.text().catch(()=>'Unbekannter Fehler');
-    toast('Fehler '+resp.status+': '+msg,'err');
-    return;
-  }
   toast(id?'Tunnel aktualisiert':'Tunnel erstellt');
   closeModal();loadTunnels();
 }

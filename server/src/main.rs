@@ -22,16 +22,10 @@ use tracing::{debug, error, info, warn};
 
 static STREAM_ID_COUNTER: AtomicU64 = AtomicU64::new(1);
 static ACTIVE_CONNECTIONS: AtomicUsize = AtomicUsize::new(0);
-const MAX_CONNECTIONS: usize = 200;
+const MAX_CONNECTIONS: usize = 50;
 const CLIENT_IDLE_TIMEOUT_SECS: u64 = 30;
 /// UDP sessions are cleaned up after this period of inactivity.
-/// 60 s gives games with long idle phases (Satisfactory, ARK, Valheim) time
-/// to resume without forcing a new UDP session allocation.
-const UDP_SESSION_TIMEOUT_SECS: u64 = 60;
-/// Socket send/receive buffer size for game connections.
-/// 256 KB is large enough for most game update bursts while keeping
-/// per-connection overhead low.
-const SOCKET_BUF_SIZE: usize = 256 * 1024;
+const UDP_SESSION_TIMEOUT_SECS: u64 = 30;
 /// Pre-auth cache entries expire after 10 seconds.
 /// The client must connect within this window after the manager sends the
 /// pre-auth notification, otherwise the connection will be rejected.
@@ -70,16 +64,12 @@ fn load_tls_config(cert_path: &str, key_path: &str) -> Result<Arc<rustls::Server
 }
 
 fn is_valid_game_port(port: u16) -> bool {
-    // Explicitly allow HTTP (80) and HTTPS (443) so plain TCP tunnels can
-    // carry web traffic without needing a dedicated proxy.
-    if port == 80 || port == 443 { return true; }
-    // Block other privileged ports and the server's own management ports.
     if port < 1024 { return false; }
     if port == 9000 || port == 9001 { return false; }
     true
 }
 
-fn apply_socket_options(stream: &TcpStream) {
+fn apply_keepalive(stream: &TcpStream) {
     use std::time::Duration;
     let sock_ref = socket2::SockRef::from(stream);
     let keepalive = socket2::TcpKeepalive::new()
@@ -88,13 +78,6 @@ fn apply_socket_options(stream: &TcpStream) {
         .with_retries(3);
     if let Err(e) = sock_ref.set_tcp_keepalive(&keepalive) {
         warn!("Failed to set TCP keepalive: {:?}", e);
-    }
-    // Larger send/receive buffers improve throughput for game traffic bursts.
-    if let Err(e) = sock_ref.set_send_buffer_size(SOCKET_BUF_SIZE) {
-        warn!("Failed to set SO_SNDBUF: {:?}", e);
-    }
-    if let Err(e) = sock_ref.set_recv_buffer_size(SOCKET_BUF_SIZE) {
-        warn!("Failed to set SO_RCVBUF: {:?}", e);
     }
 }
 
@@ -190,7 +173,7 @@ async fn main() -> Result<()> {
     loop {
         let (tcp_stream, addr) = listener.accept().await?;
         tcp_stream.set_nodelay(true).ok();
-        apply_socket_options(&tcp_stream);
+        apply_keepalive(&tcp_stream);
 
         let conn_count = ACTIVE_CONNECTIONS.fetch_add(1, Ordering::Relaxed);
         if conn_count >= MAX_CONNECTIONS {
@@ -425,7 +408,7 @@ async fn handle_control_message(
                         res = listener.accept() => { match res {
                             Ok((player_stream, peer)) => {
                                 player_stream.set_nodelay(true).ok();
-                                apply_socket_options(&player_stream);
+                                apply_keepalive(&player_stream);
                                 let stream_id = STREAM_ID_COUNTER.fetch_add(1, Ordering::Relaxed);
                                 debug!("Player {} connected (stream {} TCP)", peer, stream_id);
                                 let (player_tx, player_rx) = mpsc::channel::<Vec<u8>>(2048);
