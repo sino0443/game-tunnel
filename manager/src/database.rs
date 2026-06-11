@@ -212,6 +212,32 @@ pub async fn get_server_for_client_uuid(
 
 
 
+/// Returns ALL distinct server_ids that have at least one tunnel assigned
+/// to `client_id`.  Used by the multi-server endpoint so the client can
+/// connect to every server that has tunnels waiting for it.
+pub async fn get_servers_for_client(
+    pool: &MySqlPool,
+    client_id: &str,
+) -> Result<Vec<u32>> {
+    let rows = sqlx::query(
+        "SELECT DISTINCT server_id
+         FROM   tunnels
+         WHERE  client_id = ? AND server_id IS NOT NULL
+         ORDER  BY server_id ASC",
+    )
+    .bind(client_id)
+    .fetch_all(pool)
+    .await?;
+
+    Ok(rows
+        .iter()
+        .filter_map(|r| {
+            let sid = r.try_get::<i32, _>("server_id").unwrap_or(0);
+            if sid > 0 { Some(sid as u32) } else { None }
+        })
+        .collect())
+}
+
 /// Returns the server_id that has the most tunnels assigned to a given
 /// client_id.  Only considers tunnels where server_id IS NOT NULL.
 /// Returns None when the client has no such tunnels.

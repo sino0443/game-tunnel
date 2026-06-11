@@ -130,8 +130,10 @@ async fn main() -> Result<()> {
         .route("/api/stats", get(get_stats))
         .route("/api/tunnels", get(get_tunnels))
         .route("/api/clients", get(get_clients))
-        // Client asks manager: "which server should I connect to?"
+        // Client asks manager: "which server should I connect to?" (legacy single-server)
         .route("/api/client/{uuid}/server", get(get_server_for_client))
+        // Client asks manager: "which servers do I need to connect to?" (multi-server)
+        .route("/api/client/{uuid}/servers", get(get_servers_for_client))
         .layer(CorsLayer::permissive())
         .with_state(state);
 
@@ -515,4 +517,118 @@ async fn get_server_for_client(
     Ok(Json(ServerAssignmentResponse {
         server_id: mapping.server_id,
     }))
+}
+
+// ── Multi-server assignment endpoint ─────────────────────────────────────────
+
+#[derive(Serialize)]
+struct ServerAssignmentsResponse {
+    server_ids: Vec<u32>,
+}
+
+/// `GET /api/client/:uuid/servers`
+///
+/// Returns **all** server_ids the client should connect to, based on which
+/// VPS servers currently have tunnels assigned to it.  Sends pre-auth
+/// notifications to all of those servers concurrently so the client can
+/// establish connections to all of them in parallel.
+///
+/// Falls back to the single mapping in `client_server_mappings` when no
+/// tunnel-based assignment exists yet.
+async fn get_servers_for_client(
+    Path(uuid): Path<String>,
+    State(state): State<Arc<AppState>>,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    // 1. Resolve client_id and check allowed flag.
+    //    Try client_server_mappings first; fall back to manager config by UUID.
+    let (client_id, fallback_server_id) = {
+        let db_row = database::get_server_for_client_uuid(&state.db, &uuid)
+            .await
+            .map_err(|e| {
+                error!("DB error looking up UUID {}: {:?}", uuid, e);
+                (StatusCode::INTERNAL_SERVER_ERROR, "database error".to_string())
+            })?;
+
+        match db_row {
+            Some(m) if !m.allowed => {
+                warn!("Client UUID {} is not allowed", uuid);
+                return Err((StatusCode::FORBIDDEN, "client not allowed".to_string()));
+            }
+            Some(m) => (m.client_id, Some(m.server_id)),
+            None => {
+                // Not in DB yet – look up by UUID in manager config (before first sync).
+                match state.config.clients.iter().find(|c| c.uuid.as_deref() == Some(&uuid)) {
+                    Some(c) => (c.id.clone(), None),
+                    None => {
+                        warn!("No mapping found for client UUID {}", uuid);
+                        return Err((StatusCode::NOT_FOUND, "no server mapping found".to_string()));
+                    }
+                }
+            }
+        }
+    };
+
+    // 2. Determine which servers this client needs to connect to.
+    let mut server_ids = database::get_servers_for_client(&state.db, &client_id)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    // Fallback: no tunnel-based assignments yet → use the mapping row or first server.
+    if server_ids.is_empty() {
+        if let Some(sid) = fallback_server_id {
+            server_ids.push(sid);
+        } else if let Some(s) = state.config.servers.first() {
+            server_ids.push(s.id);
+        } else {
+            return Err((StatusCode::SERVICE_UNAVAILABLE, "no servers configured".to_string()));
+        }
+    }
+
+    // 3. Send pre-auth to all servers concurrently (best-effort: we always
+    //    return the full list; the client handles individual auth failures).
+    let tasks: Vec<_> = server_ids
+        .iter()
+        .filter_map(|&sid| {
+            let cfg = state.config.servers.iter().find(|s| s.id == sid)?;
+            let url = format!("{}/api/manager/pre-auth", cfg.mgmt_url.trim_end_matches('/'));
+            let body = serde_json::json!({ "client_uuid": uuid });
+            let http = state.http_client.clone();
+            let uuid_c = uuid.clone();
+            Some((sid, tokio::spawn(async move {
+                tokio::time::timeout(
+                    tokio::time::Duration::from_secs(10),
+                    http.post(&url).json(&body).send(),
+                )
+                .await
+                .map(|r| r.map(|resp| (resp.status().is_success(), uuid_c)))
+            })))
+        })
+        .collect();
+
+    for (sid, task) in tasks {
+        match task.await {
+            Ok(Ok(Ok((true, ref u)))) => {
+                info!("Pre-auth OK: client UUID {} → server {}", u, sid);
+            }
+            Ok(Ok(Ok((false, _)))) => {
+                warn!("Server {} rejected pre-auth for UUID {}", sid, uuid);
+            }
+            Ok(Ok(Err(e))) => {
+                warn!("Could not reach server {} mgmt for UUID {}: {:?}", sid, uuid, e);
+            }
+            Ok(Err(_)) => {
+                warn!("Pre-auth timed out for server {} (UUID {})", sid, uuid);
+            }
+            Err(e) => {
+                warn!("Pre-auth task panicked for server {}: {:?}", sid, e);
+            }
+        }
+    }
+
+    info!(
+        "Servers for client UUID {} ({}): {:?}",
+        uuid, client_id, server_ids
+    );
+
+    Ok(Json(ServerAssignmentsResponse { server_ids }))
 }

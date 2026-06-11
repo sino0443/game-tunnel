@@ -172,26 +172,26 @@ async fn connect_to_server(
 // ── Manager server-assignment ─────────────────────────────────────────────────
 
 #[derive(serde::Deserialize)]
-struct ServerAssignmentResponse {
-    server_id: u32,
+struct ServerAssignmentsResponse {
+    server_ids: Vec<u32>,
 }
 
-/// Asks the manager which server this client should connect to.
+/// Queries the manager for **all** servers this client should connect to.
 ///
 /// The manager will:
-/// 1. Look up `client_uuid` in `client_server_mappings`
-/// 2. Notify the assigned server (pre-auth, 10s TTL on server side)
-/// 3. Return the `server_id`
+/// 1. Resolve the client's tunnel assignments from the database
+/// 2. Send pre-auth notifications to each server concurrently
+/// 3. Return the list of server_ids
 ///
-/// Returns an error if the manager is unreachable, the UUID is unknown,
-/// or the server did not respond to the manager's pre-auth notification.
-async fn query_server_from_manager(
+/// Each returned server_id has had pre-auth sent so the client can connect
+/// within the 10-second TTL window.
+async fn query_servers_from_manager(
     http_client: &reqwest::Client,
     manager_url: &str,
     client_uuid: &str,
-) -> Result<u32> {
+) -> Result<Vec<u32>> {
     let url = format!(
-        "{}/api/client/{}/server",
+        "{}/api/client/{}/servers",
         manager_url.trim_end_matches('/'),
         client_uuid
     );
@@ -207,11 +207,11 @@ async fn query_server_from_manager(
         anyhow::bail!("manager returned HTTP {}: {}", status, body.trim());
     }
 
-    let assignment = resp
-        .json::<ServerAssignmentResponse>()
+    let r = resp
+        .json::<ServerAssignmentsResponse>()
         .await
         .context("failed to parse manager response")?;
-    Ok(assignment.server_id)
+    Ok(r.server_ids)
 }
 
 #[tokio::main]
@@ -230,6 +230,142 @@ async fn main() -> Result<()> {
         config.client_name, config.client_uuid, config.manager_url
     );
     run_client(config).await
+}
+
+/// Manages the full lifecycle of a connection to **one** specific server.
+///
+/// The task:
+/// 1. Calls the manager to get fresh pre-auth for this server (and all others)
+/// 2. Verifies that this server is still in the returned list (stops if removed)
+/// 3. Connects, runs the frame loop, cleans up on disconnect
+/// 4. Backs off and retries from step 1
+///
+/// Runs forever until the server is removed from the manager's assignment list
+/// or the task is cancelled by the connection manager.
+async fn run_server_task(
+    entry: ServerEntry,
+    client_uuid: String,
+    manager_url: String,
+    http_client: reqwest::Client,
+    state: Arc<RwLock<ClientState>>,
+    servers: Arc<RwLock<HashMap<u32, ServerConnection>>>,
+    stats: Stats,
+) {
+    let server_id = entry.id;
+    let mut backoff = 2u64;
+
+    loop {
+        // Request pre-auth by querying the manager.  This also verifies that
+        // this server is still relevant for our client.
+        match query_servers_from_manager(&http_client, &manager_url, &client_uuid).await {
+            Ok(ids) => {
+                if !ids.contains(&server_id) {
+                    info!(
+                        "Server {} ('{}') no longer assigned — stopping connection task",
+                        server_id, entry.name
+                    );
+                    return;
+                }
+                backoff = 2;
+            }
+            Err(e) => {
+                error!(
+                    "Manager query failed for server '{}': {:?} (retry in {}s)",
+                    entry.name, e, backoff
+                );
+                tokio::time::sleep(tokio::time::Duration::from_secs(backoff)).await;
+                backoff = (backoff * 2).min(60);
+                continue;
+            }
+        }
+
+        info!(
+            "Connecting to server '{}' at {} (server_id: {}, UUID: {})",
+            entry.name, entry.address, server_id, client_uuid
+        );
+
+        match connect_to_server(&entry, Some(client_uuid.clone())).await {
+            Ok((read_half, write_half)) => {
+                info!("Server '{}' connected and authenticated", entry.name);
+                stats.set_server_tls_ok(entry.id).await;
+                stats.set_server_auth_ok(entry.id).await;
+                backoff = 2;
+
+                let (write_tx, mut write_rx) = mpsc::channel::<Frame>(8192);
+                let writer_task = tokio::spawn(async move {
+                    let mut wh = write_half;
+                    while let Some(frame) = write_rx.recv().await {
+                        let r = match &frame {
+                            Frame::Control(msg) => protocol::write_control(&mut wh, msg).await,
+                            Frame::Data { stream_id, payload } => protocol::write_data(&mut wh, *stream_id, payload).await,
+                            Frame::StreamClose { stream_id } => protocol::write_stream_close(&mut wh, *stream_id).await,
+                        };
+                        if r.is_err() { break; }
+                    }
+                });
+
+                servers.write().await.insert(entry.id, ServerConnection {
+                    id: entry.id, name: entry.name.clone(), write_tx,
+                });
+
+                let mut rh = read_half;
+                let idle_timeout = tokio::time::Duration::from_secs(SERVER_IDLE_TIMEOUT_SECS);
+                loop {
+                    let frame = match tokio::time::timeout(idle_timeout, protocol::read_frame(&mut rh)).await {
+                        Ok(Ok(f)) => f,
+                        Ok(Err(e)) => {
+                            let msg = e.to_string();
+                            if !msg.contains("close_notify") && !msg.contains("peer closed") {
+                                error!("Server '{}' error: {:?}", entry.name, e);
+                            }
+                            break;
+                        }
+                        Err(_) => {
+                            warn!("Server '{}' idle timeout ({}s), reconnecting", entry.name, SERVER_IDLE_TIMEOUT_SECS);
+                            break;
+                        }
+                    };
+                    if let Err(e) = handle_server_frame(frame, entry.id, &state, &servers, &stats).await {
+                        error!("Frame error on server '{}': {:?}", entry.name, e);
+                        break;
+                    }
+                }
+
+                stats.set_server_disconnected(entry.id).await;
+                servers.write().await.remove(&entry.id);
+                writer_task.abort();
+
+                // Clean up tunnels that were on this server.
+                let to_remove: Vec<(u32, u32)> = {
+                    let st = state.read().await;
+                    st.tunnels.iter()
+                        .filter(|(_, t)| t.server_id == entry.id)
+                        .map(|(db_id, t)| (*db_id, t.tunnel_id))
+                        .collect()
+                };
+                if !to_remove.is_empty() {
+                    let mut st = state.write().await;
+                    for (db_id, tunnel_id) in &to_remove {
+                        if let Some(t) = st.tunnels.remove(db_id) {
+                            st.tunnel_local_addrs.remove(&t.tunnel_id);
+                            st.tunnel_protocols.remove(&t.tunnel_id);
+                            st.tunnel_server.remove(&t.tunnel_id);
+                        }
+                        stats.remove_tunnel(*tunnel_id).await;
+                    }
+                    info!("Cleaned up {} tunnels from '{}'", to_remove.len(), entry.name);
+                }
+                info!("Server '{}' disconnected, reconnecting in {}s", entry.name, backoff);
+            }
+            Err(e) => {
+                stats.set_server_disconnected(entry.id).await;
+                error!("Connect failed to '{}': {:?} (retry in {}s)", entry.name, e, backoff);
+            }
+        }
+
+        tokio::time::sleep(tokio::time::Duration::from_secs(backoff)).await;
+        backoff = (backoff * 2).min(30);
+    }
 }
 
 async fn run_client(config: ClientConfig) -> Result<()> {
@@ -279,155 +415,75 @@ async fn run_client(config: ClientConfig) -> Result<()> {
         .timeout(std::time::Duration::from_secs(15))
         .build()?;
 
-    // Spawn a single connection task that:
-    //  1. Queries the manager for the assigned server_id
-    //  2. Looks up that server_id in the local [[servers]] list
-    //  3. Connects and runs the tunnel loop
-    //  4. On disconnect: loops back to step 1 (assignment may have changed)
+    // Connection manager: polls the manager every 10 s for the full server list
+    // and spawns one independent run_server_task per assigned server.
+    // Tasks for newly assigned servers are started immediately; tasks for servers
+    // that are no longer assigned are aborted.
     {
-        let config_clone = config.clone();
-        let stats_clone = stats.clone();
+        let config_clone  = config.clone();
+        let stats_clone   = stats.clone();
         let servers_clone = Arc::clone(&servers);
-        let state_clone = Arc::clone(&state);
-        let http_client_clone = http_client.clone();
+        let state_clone   = Arc::clone(&state);
+        let http_clone    = http_client.clone();
 
         tokio::spawn(async move {
-            let mut backoff = 2u64;
+            // server_id → JoinHandle of the per-server task
+            let mut active: HashMap<u32, tokio::task::JoinHandle<()>> = HashMap::new();
+            let mut backoff = 5u64;
+
             loop {
-                // Step 1: ask manager which server to use.
-                info!(
-                    "Querying manager for server assignment (UUID: {})",
-                    config_clone.client_uuid
-                );
-                let server_id = match query_server_from_manager(
-                    &http_client_clone,
+                match query_servers_from_manager(
+                    &http_clone,
                     &config_clone.manager_url,
                     &config_clone.client_uuid,
                 ).await {
-                    Ok(sid) => { backoff = 2; sid }
+                    Ok(server_ids) => {
+                        backoff = 5;
+
+                        // Spawn tasks for newly assigned or finished servers.
+                        for &sid in &server_ids {
+                            let needs_spawn = match active.get(&sid) {
+                                None    => true,
+                                Some(h) => h.is_finished(),
+                            };
+                            if !needs_spawn { continue; }
+
+                            let Some(entry) = config_clone.servers.iter().find(|s| s.id == sid).cloned() else {
+                                warn!("Manager assigned server {} but it is not in [[servers]] config", sid);
+                                continue;
+                            };
+
+                            info!("Spawning connection task for server {} (\'{}\')", sid, entry.name);
+                            let handle = tokio::spawn(run_server_task(
+                                entry,
+                                config_clone.client_uuid.clone(),
+                                config_clone.manager_url.clone(),
+                                http_clone.clone(),
+                                Arc::clone(&state_clone),
+                                Arc::clone(&servers_clone),
+                                stats_clone.clone(),
+                            ));
+                            active.insert(sid, handle);
+                        }
+
+                        // Abort tasks for servers no longer assigned.
+                        active.retain(|&sid, handle| {
+                            if server_ids.contains(&sid) { return true; }
+                            info!("Server {} no longer assigned — aborting task", sid);
+                            handle.abort();
+                            false
+                        });
+                    }
                     Err(e) => {
-                        error!(
-                            "Manager assignment failed: {:?} (retry in {}s)",
-                            e, backoff
-                        );
+                        error!("Manager poll failed: {:?} (retry in {}s)", e, backoff);
                         tokio::time::sleep(tokio::time::Duration::from_secs(backoff)).await;
                         backoff = (backoff * 2).min(60);
                         continue;
                     }
-                };
-
-                // Step 2: find the server entry in local config.
-                let entry = match config_clone.servers.iter().find(|s| s.id == server_id) {
-                    Some(e) => e.clone(),
-                    None => {
-                        error!(
-                            "Manager assigned server_id {} but it is not in [[servers]] config",
-                            server_id
-                        );
-                        tokio::time::sleep(tokio::time::Duration::from_secs(10)).await;
-                        continue;
-                    }
-                };
-
-                // Step 3: connect with UUID.
-                info!(
-                    "Connecting to server '{}' at {} (server_id: {}, UUID: {})",
-                    entry.name, entry.address, server_id, config_clone.client_uuid
-                );
-                match connect_to_server(&entry, Some(config_clone.client_uuid.clone())).await {
-                    Ok((read_half, write_half)) => {
-                        info!("Server '{}' connected and authenticated", entry.name);
-                        stats_clone.set_server_tls_ok(entry.id).await;
-                        stats_clone.set_server_auth_ok(entry.id).await;
-                        backoff = 2;
-
-                        let (write_tx, mut write_rx) = mpsc::channel::<Frame>(8192);
-                        let writer_task = tokio::spawn(async move {
-                            let mut wh = write_half;
-                            while let Some(frame) = write_rx.recv().await {
-                                let r = match &frame {
-                                    Frame::Control(msg) => protocol::write_control(&mut wh, msg).await,
-                                    Frame::Data { stream_id, payload } => protocol::write_data(&mut wh, *stream_id, payload).await,
-                                    Frame::StreamClose { stream_id } => protocol::write_stream_close(&mut wh, *stream_id).await,
-                                };
-                                if let Err(_) = r { break; }
-                            }
-                        });
-
-                        servers_clone.write().await.insert(entry.id, ServerConnection {
-                            id: entry.id, name: entry.name.clone(), write_tx,
-                        });
-
-                        let mut rh = read_half;
-                        let idle_timeout = tokio::time::Duration::from_secs(SERVER_IDLE_TIMEOUT_SECS);
-                        loop {
-                            let frame = match tokio::time::timeout(idle_timeout, protocol::read_frame(&mut rh)).await {
-                                Ok(Ok(f)) => f,
-                                Ok(Err(e)) => {
-                                    let msg = e.to_string();
-                                    if !msg.contains("close_notify") && !msg.contains("peer closed") {
-                                        error!("Server '{}' error: {:?}", entry.name, e);
-                                    }
-                                    break;
-                                }
-                                Err(_) => {
-                                    warn!(
-                                        "Server '{}' idle timeout ({}s), reconnecting",
-                                        entry.name, SERVER_IDLE_TIMEOUT_SECS
-                                    );
-                                    break;
-                                }
-                            };
-                            if let Err(e) = handle_server_frame(
-                                frame, entry.id, &state_clone, &servers_clone, &stats_clone,
-                            ).await {
-                                error!("Frame error: {:?}", e);
-                                break;
-                            }
-                        }
-
-                        stats_clone.set_server_disconnected(entry.id).await;
-                        servers_clone.write().await.remove(&entry.id);
-                        writer_task.abort();
-
-                        // Clean up tunnels that were on this server.
-                        let to_remove: Vec<(u32, u32)> = {
-                            let st = state_clone.read().await;
-                            st.tunnels.iter()
-                                .filter(|(_, t)| t.server_id == entry.id)
-                                .map(|(db_id, t)| (*db_id, t.tunnel_id))
-                                .collect()
-                        };
-                        if !to_remove.is_empty() {
-                            let mut st = state_clone.write().await;
-                            for (db_id, tunnel_id) in &to_remove {
-                                if let Some(t) = st.tunnels.remove(db_id) {
-                                    st.tunnel_local_addrs.remove(&t.tunnel_id);
-                                    st.tunnel_protocols.remove(&t.tunnel_id);
-                                    st.tunnel_server.remove(&t.tunnel_id);
-                                }
-                                stats_clone.remove_tunnel(*tunnel_id).await;
-                            }
-                            info!(
-                                "Cleaned up {} tunnels from '{}'",
-                                to_remove.len(), entry.name
-                            );
-                        }
-                        info!(
-                            "Server '{}' disconnected, re-querying manager in {}s",
-                            entry.name, backoff
-                        );
-                    }
-                    Err(e) => {
-                        stats_clone.set_server_disconnected(entry.id).await;
-                        error!(
-                            "Connect failed to '{}': {:?} (retry in {}s)",
-                            entry.name, e, backoff
-                        );
-                    }
                 }
-                tokio::time::sleep(tokio::time::Duration::from_secs(backoff)).await;
-                backoff = (backoff * 2).min(30);
+
+                // Re-check every 10 s to pick up new assignments.
+                tokio::time::sleep(tokio::time::Duration::from_secs(10)).await;
             }
         });
     }
