@@ -23,7 +23,10 @@ pub enum Frame {
 #[derive(Debug, Clone)]
 pub enum Message {
     /// Client authenticates with the server.
-    Auth { secret: String },
+    /// `client_uuid` is the UUID assigned in the client's config. When present
+    /// the server checks its pre-auth cache (populated by the manager) before
+    /// accepting the connection.
+    Auth { secret: String, client_uuid: Option<String> },
     /// Server acknowledges successful authentication.
     AuthOk,
     /// Server rejects authentication.
@@ -83,7 +86,17 @@ impl Message {
     /// Encode a control message to payload bytes.
     pub fn encode(&self) -> Vec<u8> {
         let (msg_type, payload) = match self {
-            Message::Auth { secret } => (MSG_AUTH, secret.as_bytes().to_vec()),
+            Message::Auth { secret, client_uuid } => {
+                // Wire format: [uuid_len: u16 BE][uuid_bytes][secret_bytes]
+                // uuid_len == 0 means no UUID.
+                let uuid_bytes = client_uuid.as_deref().unwrap_or("").as_bytes();
+                let uuid_len = uuid_bytes.len() as u16;
+                let mut buf = Vec::with_capacity(2 + uuid_bytes.len() + secret.len());
+                buf.extend_from_slice(&uuid_len.to_be_bytes());
+                buf.extend_from_slice(uuid_bytes);
+                buf.extend_from_slice(secret.as_bytes());
+                (MSG_AUTH, buf)
+            }
             Message::AuthOk => (MSG_AUTH_OK, vec![]),
             Message::AuthFailed { reason } => (MSG_AUTH_FAILED, reason.as_bytes().to_vec()),
             Message::OpenTunnel {
@@ -131,9 +144,26 @@ impl Message {
 
         match msg_type {
             MSG_AUTH => {
+                // Wire format: [uuid_len: u16 BE][uuid_bytes][secret_bytes]
+                if payload.len() < 2 {
+                    anyhow::bail!("Auth payload too short");
+                }
+                let uuid_len = u16::from_be_bytes(payload[0..2].try_into()?) as usize;
+                if payload.len() < 2 + uuid_len {
+                    anyhow::bail!("Auth payload too short for UUID");
+                }
+                let client_uuid = if uuid_len > 0 {
+                    Some(
+                        String::from_utf8(payload[2..2 + uuid_len].to_vec())
+                            .context("invalid UTF-8 in client_uuid")?,
+                    )
+                } else {
+                    None
+                };
                 let secret =
-                    String::from_utf8(payload.to_vec()).context("invalid UTF-8 in auth")?;
-                Ok(Message::Auth { secret })
+                    String::from_utf8(payload[2 + uuid_len..].to_vec())
+                        .context("invalid UTF-8 in secret")?;
+                Ok(Message::Auth { secret, client_uuid })
             }
             MSG_AUTH_OK => Ok(Message::AuthOk),
             MSG_AUTH_FAILED => {

@@ -143,6 +143,59 @@ pub async fn get_assigned_tunnels_for_dns(pool: &MySqlPool) -> Result<Vec<DnsTun
     }).collect())
 }
 
+// ── client_server_mappings ──────────────────────────────────────────────────
+
+/// Creates the `client_server_mappings` table if it does not yet exist.
+/// Call once at startup after `ensure_columns`.
+pub async fn ensure_client_server_table(pool: &MySqlPool) -> Result<()> {
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS client_server_mappings (
+            id          INT AUTO_INCREMENT PRIMARY KEY,
+            client_uuid VARCHAR(36)  NOT NULL,
+            client_id   VARCHAR(50)  NOT NULL,
+            server_id   INT          NOT NULL,
+            allowed     BOOLEAN      NOT NULL DEFAULT TRUE,
+            created_at  DATETIME     NOT NULL DEFAULT NOW(),
+            updated_at  DATETIME     NOT NULL DEFAULT NOW() ON UPDATE NOW(),
+            UNIQUE KEY  uq_client_uuid (client_uuid),
+            INDEX       idx_csm_server (server_id)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4",
+    )
+    .execute(pool)
+    .await?;
+    info!("client_server_mappings table ensured");
+    Ok(())
+}
+
+pub struct ClientServerMapping {
+    pub client_uuid: String,
+    pub client_id: String,
+    pub server_id: u32,
+    pub allowed: bool,
+}
+
+/// Returns the server mapping for a given client UUID, if one exists.
+pub async fn get_server_for_client_uuid(
+    pool: &MySqlPool,
+    client_uuid: &str,
+) -> Result<Option<ClientServerMapping>> {
+    let row = sqlx::query(
+        "SELECT client_uuid, client_id, server_id, allowed
+         FROM client_server_mappings
+         WHERE client_uuid = ?",
+    )
+    .bind(client_uuid)
+    .fetch_optional(pool)
+    .await?;
+
+    Ok(row.map(|r| ClientServerMapping {
+        client_uuid: r.try_get("client_uuid").unwrap_or_default(),
+        client_id:   r.try_get("client_id").unwrap_or_default(),
+        server_id:   r.try_get("server_id").unwrap_or(0),
+        allowed:     r.try_get("allowed").unwrap_or(false),
+    }))
+}
+
 pub struct TunnelRow {
     pub id: u32, pub name: String, pub subdomain: String, pub domain: String,
     pub online: bool, pub client_id: Option<String>, pub server_id: Option<u32>,
