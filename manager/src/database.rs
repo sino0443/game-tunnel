@@ -18,7 +18,7 @@ pub async fn ensure_columns(pool: &MySqlPool) -> Result<()> {
         ("dns_set", "BOOLEAN NOT NULL DEFAULT FALSE"),
     ];
     for (col, def) in &columns {
-        let sql = format!("ALTER TABLE tunnels ADD COLUMN IF NOT EXISTS {} {}", col, def);
+        let sql = format!("ALTER TABLE tunnels ADD COLUMN {} {}", col, def);
         if let Err(e) = sqlx::query(&sql).execute(pool).await {
             if !e.to_string().contains("Duplicate column") { warn!("Column check {}: {:?}", col, e); }
         }
