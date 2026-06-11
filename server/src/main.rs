@@ -194,7 +194,20 @@ async fn main() -> Result<()> {
                     info!("Client {} TLS handshake complete", addr);
                     if let Err(e) = handle_client(tls_stream, addr, &config, &public_bind, cache).await {
                         let msg = e.to_string();
-                        if !msg.contains("close_notify") && !msg.contains("peer closed") && !msg.contains("idle timeout") {
+                        if msg.contains("close_notify") || msg.contains("peer closed") || msg.contains("idle timeout") {
+                            // Expected disconnects – silent.
+                        } else if msg.contains("malformed auth frame")
+                            || msg.contains("expected Auth frame")
+                            || msg.contains("authentication timeout")
+                            || msg.contains("authentication failed")
+                            || msg.contains("pre-auth expired")
+                            || msg.contains("not pre-authorized")
+                            || msg.contains("Auth payload")
+                        {
+                            // Auth rejections are expected (e.g. external scanners,
+                            // expired pre-auth, wrong secret) – log as WARN, not ERROR.
+                            warn!("Client {} auth rejected: {}", addr, msg);
+                        } else {
                             error!("Client {} error: {:?}", addr, e);
                         }
                     }
@@ -223,7 +236,15 @@ async fn handle_client(
 
     let frame = match tokio::time::timeout(tokio::time::Duration::from_secs(10), protocol::read_frame(&mut read_half)).await {
         Ok(Ok(f)) => f,
-        Ok(Err(e)) => return Err(e.into()),
+        Ok(Err(e)) => {
+            // Malformed frame – inform the client before closing so it knows
+            // why the connection was rejected (prevents silent EOF reconnect loops).
+            let _ = protocol::write_control(
+                &mut write_half,
+                &Message::AuthFailed { reason: "malformed auth frame".into() },
+            ).await;
+            return Err(e.into());
+        }
         Err(_) => { warn!("Auth timeout for {}", addr); anyhow::bail!("authentication timeout"); }
     };
 
@@ -274,7 +295,13 @@ async fn handle_client(
             protocol::write_control(&mut write_half, &Message::AuthOk).await?;
             info!("Client {} authenticated (server_id: {})", addr, config.server_id);
         }
-        _ => anyhow::bail!("expected Auth frame"),
+        _ => {
+            let _ = protocol::write_control(
+                &mut write_half,
+                &Message::AuthFailed { reason: "expected auth frame".into() },
+            ).await;
+            anyhow::bail!("expected Auth frame");
+        }
     }
 
     let state = Arc::new(RwLock::new(ServerState {
