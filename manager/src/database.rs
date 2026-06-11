@@ -232,8 +232,12 @@ pub async fn get_servers_for_client(
     Ok(rows
         .iter()
         .filter_map(|r| {
-            let sid = r.try_get::<i32, _>("server_id").unwrap_or(0);
-            if sid > 0 { Some(sid as u32) } else { None }
+            // Use u32 to match how tunnels.server_id is typed everywhere else
+            // (web, client, manager stats all use try_get::<Option<u32>, _>).
+            // Using i32 here silently returns 0 on UNSIGNED INT columns and
+            // causes every row to be filtered out.
+            let sid: u32 = r.try_get("server_id").unwrap_or(0);
+            if sid > 0 { Some(sid) } else { None }
         })
         .collect())
 }
@@ -258,8 +262,8 @@ pub async fn get_best_server_for_client(
     .await?;
 
     Ok(row.and_then(|r| {
-        let sid = r.try_get::<i32, _>("server_id").unwrap_or(0);
-        if sid > 0 { Some(sid as u32) } else { None }
+        let sid: u32 = r.try_get("server_id").unwrap_or(0);
+        if sid > 0 { Some(sid) } else { None }
     }))
 }
 
