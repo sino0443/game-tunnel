@@ -214,7 +214,19 @@ async fn main() -> Result<()> {
                 }
                 Err(e) => {
                     let msg = e.to_string();
-                    if !msg.contains("InvalidContentType") && !msg.contains("close_notify") && !msg.contains("UnknownIssuer") {
+                    // These are all expected from external scanners / probes and
+                    // produce nothing actionable — suppress or downgrade them.
+                    let scanner_noise = msg.contains("InvalidContentType")
+                        || msg.contains("close_notify")
+                        || msg.contains("UnknownIssuer")
+                        // TLS 1.2 probe against a TLS-1.3-only server.
+                        || msg.contains("Tls12NotOffered")
+                        || msg.contains("PeerIncompatible")
+                        // Scanner drops the TCP connection immediately.
+                        || msg.contains("Connection reset by peer")
+                        || msg.contains("ConnectionReset")
+                        || msg.contains("code: 104");
+                    if !scanner_noise {
                         error!("TLS handshake failed for {}: {:?}", addr, e);
                     }
                 }
