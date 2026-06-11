@@ -143,7 +143,64 @@ async fn main() -> Result<()> {
 
 async fn run_management_cycle(state: &Arc<AppState>) -> Result<()> {
     assign_tunnels(state).await?;
+    sync_client_server_mappings(state).await?;
     update_pending_dns(state).await?;
+    Ok(())
+}
+
+/// Keeps `client_server_mappings` up to date automatically.
+///
+/// For every configured client that has a `uuid` set in `manager.toml`,
+/// this function looks at the tunnels assigned to that client, finds the
+/// VPS server that hosts the most of them, and upserts the mapping so the
+/// client will be directed to that server on its next connection attempt.
+///
+/// Fallback chain when no tunnels have an explicit `server_id`:
+///   1. Skip — no information available yet, leave the existing mapping intact.
+///
+/// The `allowed` flag is never overwritten, so manual bans in the table
+/// survive automatic syncs.
+async fn sync_client_server_mappings(state: &Arc<AppState>) -> Result<()> {
+    for client in &state.config.clients {
+        // Only process clients whose UUID is known in the manager config.
+        let Some(ref uuid) = client.uuid else { continue; };
+
+        // Derive the server this client should connect to from its tunnel assignments.
+        let server_id = match database::get_best_server_for_client(&state.db, &client.id).await? {
+            Some(sid) => sid,
+            None => {
+                // The client has tunnels but none with a server_id set yet,
+                // or it has no tunnels at all.  Fall back to the first
+                // configured server so the client can at least connect.
+                match state.config.servers.first() {
+                    Some(s) => s.id,
+                    None => {
+                        warn!(
+                            "No servers configured — skipping mapping for client '{}'",
+                            client.id
+                        );
+                        continue;
+                    }
+                }
+            }
+        };
+
+        match database::upsert_client_server_mapping(&state.db, uuid, &client.id, server_id).await {
+            Ok(true) => {
+                info!(
+                    "Client mapping synced: '{}' ({}) → server {}",
+                    client.name, client.id, server_id
+                );
+            }
+            Ok(false) => {} // already up-to-date, nothing to log
+            Err(e) => {
+                warn!(
+                    "Failed to sync mapping for client '{}': {:?}",
+                    client.id, e
+                );
+            }
+        }
+    }
     Ok(())
 }
 

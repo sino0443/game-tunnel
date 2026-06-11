@@ -73,6 +73,11 @@ fn default_assign_interval() -> u64 { 5 }
 pub struct ManagedClient {
     pub id: String,
     pub name: String,
+    /// UUID des Clients (aus client.toml `client_uuid`).
+    /// Wird vom Manager benötigt, um `client_server_mappings` automatisch
+    /// aktuell zu halten. Ohne diesen Wert erfolgt kein automatisches Upsert.
+    #[serde(default)]
+    pub uuid: Option<String>,
     /// Einzelne Stats-URL (alt, für Rückwärtskompatibilität).
     #[serde(default)]
     pub stats_url: Option<String>,

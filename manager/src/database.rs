@@ -212,6 +212,65 @@ pub async fn get_server_for_client_uuid(
 
 
 
+/// Returns the server_id that has the most tunnels assigned to a given
+/// client_id.  Only considers tunnels where server_id IS NOT NULL.
+/// Returns None when the client has no such tunnels.
+pub async fn get_best_server_for_client(
+    pool: &MySqlPool,
+    client_id: &str,
+) -> Result<Option<u32>> {
+    let row = sqlx::query(
+        "SELECT server_id
+         FROM   tunnels
+         WHERE  client_id = ? AND server_id IS NOT NULL
+         GROUP  BY server_id
+         ORDER  BY COUNT(*) DESC, server_id ASC
+         LIMIT  1",
+    )
+    .bind(client_id)
+    .fetch_optional(pool)
+    .await?;
+
+    Ok(row.and_then(|r| {
+        let sid = r.try_get::<i32, _>("server_id").unwrap_or(0);
+        if sid > 0 { Some(sid as u32) } else { None }
+    }))
+}
+
+/// Upserts a row in `client_server_mappings`.
+///
+/// On first insert the `allowed` flag is set to TRUE.
+/// On duplicate key (same `client_uuid`) only `client_id`, `server_id`,
+/// and `updated_at` are refreshed — `allowed` is intentionally left
+/// untouched so that manual bans survive automatic syncs.
+///
+/// Returns `true` when a row was inserted or changed, `false` when the
+/// existing row already had the same values.
+pub async fn upsert_client_server_mapping(
+    pool: &MySqlPool,
+    client_uuid: &str,
+    client_id: &str,
+    server_id: u32,
+) -> Result<bool> {
+    let res = sqlx::query(
+        "INSERT INTO client_server_mappings
+             (client_uuid, client_id, server_id, allowed)
+         VALUES (?, ?, ?, TRUE)
+         ON DUPLICATE KEY UPDATE
+             client_id  = VALUES(client_id),
+             server_id  = VALUES(server_id),
+             updated_at = NOW()",
+    )
+    .bind(client_uuid)
+    .bind(client_id)
+    .bind(server_id as i32)
+    .execute(pool)
+    .await?;
+
+    // MySQL ON DUPLICATE KEY: 1 = inserted, 2 = updated, 0 = no change.
+    Ok(res.rows_affected() >= 1)
+}
+
 pub struct TunnelRow {
     pub id: u32, pub name: String, pub subdomain: String, pub domain: String,
     pub online: bool, pub client_id: Option<String>, pub server_id: Option<u32>,
