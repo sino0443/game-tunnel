@@ -232,12 +232,13 @@ pub async fn get_servers_for_client(
     Ok(rows
         .iter()
         .filter_map(|r| {
-            // Use u32 to match how tunnels.server_id is typed everywhere else
-            // (web, client, manager stats all use try_get::<Option<u32>, _>).
-            // Using i32 here silently returns 0 on UNSIGNED INT columns and
-            // causes every row to be filtered out.
-            let sid: u32 = r.try_get("server_id").unwrap_or(0);
-            if sid > 0 { Some(sid) } else { None }
+            // Mirror exactly how every other place in the codebase reads
+            // tunnels.server_id: try_get::<Option<u32>, _>.
+            // Bare `u32` or `i32` both fail depending on whether the column
+            // is signed/unsigned; Option<u32> handles both via sqlx coercion.
+            r.try_get::<Option<u32>, _>("server_id")
+                .unwrap_or(None)
+                .filter(|&s| s > 0)
         })
         .collect())
 }
@@ -262,8 +263,9 @@ pub async fn get_best_server_for_client(
     .await?;
 
     Ok(row.and_then(|r| {
-        let sid: u32 = r.try_get("server_id").unwrap_or(0);
-        if sid > 0 { Some(sid) } else { None }
+        r.try_get::<Option<u32>, _>("server_id")
+            .unwrap_or(None)
+            .filter(|&s| s > 0)
     }))
 }
 
