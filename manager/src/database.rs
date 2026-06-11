@@ -219,8 +219,11 @@ pub async fn get_servers_for_client(
     pool: &MySqlPool,
     client_id: &str,
 ) -> Result<Vec<u32>> {
-    let rows = sqlx::query(
-        "SELECT DISTINCT server_id
+    // CAST(server_id AS UNSIGNED) forces MySQL to return UNSIGNED BIGINT,
+    // which sqlx maps unambiguously to u64 regardless of how tunnels.server_id
+    // is declared (INT, INT UNSIGNED, TINYINT, …).
+    let rows: Vec<u64> = sqlx::query_scalar(
+        "SELECT DISTINCT CAST(server_id AS UNSIGNED)
          FROM   tunnels
          WHERE  client_id = ? AND server_id IS NOT NULL
          ORDER  BY server_id ASC",
@@ -229,18 +232,9 @@ pub async fn get_servers_for_client(
     .fetch_all(pool)
     .await?;
 
-    Ok(rows
-        .iter()
-        .filter_map(|r| {
-            // Mirror exactly how every other place in the codebase reads
-            // tunnels.server_id: try_get::<Option<u32>, _>.
-            // Bare `u32` or `i32` both fail depending on whether the column
-            // is signed/unsigned; Option<u32> handles both via sqlx coercion.
-            r.try_get::<Option<u32>, _>("server_id")
-                .unwrap_or(None)
-                .filter(|&s| s > 0)
-        })
-        .collect())
+    let result: Vec<u32> = rows.into_iter().filter(|&s| s > 0).map(|s| s as u32).collect();
+    tracing::debug!("get_servers_for_client({:?}) → {:?}", client_id, result);
+    Ok(result)
 }
 
 /// Returns the server_id that has the most tunnels assigned to a given
@@ -250,8 +244,8 @@ pub async fn get_best_server_for_client(
     pool: &MySqlPool,
     client_id: &str,
 ) -> Result<Option<u32>> {
-    let row = sqlx::query(
-        "SELECT server_id
+    let sid: Option<u64> = sqlx::query_scalar(
+        "SELECT CAST(server_id AS UNSIGNED)
          FROM   tunnels
          WHERE  client_id = ? AND server_id IS NOT NULL
          GROUP  BY server_id
@@ -262,11 +256,10 @@ pub async fn get_best_server_for_client(
     .fetch_optional(pool)
     .await?;
 
-    Ok(row.and_then(|r| {
-        r.try_get::<Option<u32>, _>("server_id")
-            .unwrap_or(None)
-            .filter(|&s| s > 0)
-    }))
+    Ok(match sid {
+        Some(s) if s > 0 => Some(s as u32),
+        _ => None,
+    })
 }
 
 /// Upserts a row in `client_server_mappings`.
