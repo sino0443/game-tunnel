@@ -188,13 +188,29 @@ pub async fn get_server_for_client_uuid(
     .fetch_optional(pool)
     .await?;
 
-    Ok(row.map(|r| ClientServerMapping {
-        client_uuid: r.try_get("client_uuid").unwrap_or_default(),
-        client_id:   r.try_get("client_id").unwrap_or_default(),
-        server_id:   r.try_get("server_id").unwrap_or(0),
-        allowed:     r.try_get("allowed").unwrap_or(false),
-    }))
+    if let Some(r) = row {
+        // 1. Als i32 auslesen (das matcht exakt mit dem MySQL INT-Typ)
+        let server_id_signed = r.try_get::<i32, _>("server_id").unwrap_or(0);
+        
+        // 2. Sicher in u32 konvertieren (falls negativ, wird es 0)
+        let server_id = if server_id_signed >= 0 {
+            server_id_signed as u32
+        } else {
+            0
+        };
+
+        Ok(Some(ClientServerMapping {
+            client_uuid: r.try_get("client_uuid").unwrap_or_default(),
+            client_id:   r.try_get("client_id").unwrap_or_default(),
+            server_id,
+            allowed:     r.try_get("allowed").unwrap_or(false),
+        }))
+    } else {
+        Ok(None)
+    }
 }
+
+
 
 pub struct TunnelRow {
     pub id: u32, pub name: String, pub subdomain: String, pub domain: String,
