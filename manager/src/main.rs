@@ -573,7 +573,7 @@ async fn get_servers_for_client(
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
-   
+    // Fallback: client has no tunnels with a server_id yet (bootstrap — first connection
     // before any tunnel has been created / assigned a VPS server).
     // We do NOT fall back when the client previously had tunnels that were deleted:
     // in that case we intentionally return [] so the client disconnects from servers
