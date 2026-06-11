@@ -1,7 +1,8 @@
 use anyhow::{Context, Result};
 
 use axum::Router;
-use axum::extract::State;
+use axum::extract::{Path, State};
+use axum::http::StatusCode;
 use axum::response::{IntoResponse, Json};
 use axum::routing::get;
 use game_tunnel_shared::config::{CloudflareConfig, ManagerConfig};
@@ -87,6 +88,7 @@ async fn main() -> Result<()> {
     let pool = database::connect(&config.database).await?;
     info!("Connected to MySQL");
     database::ensure_columns(&pool).await?;
+    database::ensure_client_server_table(&pool).await?;
 
     let http_client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(5))
@@ -128,6 +130,10 @@ async fn main() -> Result<()> {
         .route("/api/stats", get(get_stats))
         .route("/api/tunnels", get(get_tunnels))
         .route("/api/clients", get(get_clients))
+        // Client asks manager: "which server should I connect to?" (legacy single-server)
+        .route("/api/client/{uuid}/server", get(get_server_for_client))
+        // Client asks manager: "which servers do I need to connect to?" (multi-server)
+        .route("/api/client/{uuid}/servers", get(get_servers_for_client))
         .layer(CorsLayer::permissive())
         .with_state(state);
 
@@ -139,7 +145,64 @@ async fn main() -> Result<()> {
 
 async fn run_management_cycle(state: &Arc<AppState>) -> Result<()> {
     assign_tunnels(state).await?;
+    sync_client_server_mappings(state).await?;
     update_pending_dns(state).await?;
+    Ok(())
+}
+
+/// Keeps `client_server_mappings` up to date automatically.
+///
+/// For every configured client that has a `uuid` set in `manager.toml`,
+/// this function looks at the tunnels assigned to that client, finds the
+/// VPS server that hosts the most of them, and upserts the mapping so the
+/// client will be directed to that server on its next connection attempt.
+///
+/// Fallback chain when no tunnels have an explicit `server_id`:
+///   1. Skip — no information available yet, leave the existing mapping intact.
+///
+/// The `allowed` flag is never overwritten, so manual bans in the table
+/// survive automatic syncs.
+async fn sync_client_server_mappings(state: &Arc<AppState>) -> Result<()> {
+    for client in &state.config.clients {
+        // Only process clients whose UUID is known in the manager config.
+        let Some(ref uuid) = client.uuid else { continue; };
+
+        // Derive the server this client should connect to from its tunnel assignments.
+        let server_id = match database::get_best_server_for_client(&state.db, &client.id).await? {
+            Some(sid) => sid,
+            None => {
+                // The client has tunnels but none with a server_id set yet,
+                // or it has no tunnels at all.  Fall back to the first
+                // configured server so the client can at least connect.
+                match state.config.servers.first() {
+                    Some(s) => s.id,
+                    None => {
+                        warn!(
+                            "No servers configured — skipping mapping for client '{}'",
+                            client.id
+                        );
+                        continue;
+                    }
+                }
+            }
+        };
+
+        match database::upsert_client_server_mapping(&state.db, uuid, &client.id, server_id).await {
+            Ok(true) => {
+                info!(
+                    "Client mapping synced: '{}' ({}) → server {}",
+                    client.name, client.id, server_id
+                );
+            }
+            Ok(false) => {} // already up-to-date, nothing to log
+            Err(e) => {
+                warn!(
+                    "Failed to sync mapping for client '{}': {:?}",
+                    client.id, e
+                );
+            }
+        }
+    }
     Ok(())
 }
 
@@ -343,4 +406,252 @@ async fn get_tunnels(State(state): State<Arc<AppState>>) -> impl IntoResponse {
 
 async fn get_clients(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     Json(state.manager_state.read().await.clients.clone())
+}
+
+// ── Client server-assignment endpoint ───────────────────────────────────────
+
+#[derive(Serialize)]
+struct ServerAssignmentResponse {
+    server_id: u32,
+}
+
+/// `GET /api/client/:uuid/server`
+///
+/// Returns the server_id assigned to the given client UUID.
+///
+/// Before responding, the manager POSTs a pre-auth notification to the
+/// server's management API with a 10-second timeout. If the server does
+/// not acknowledge within 10 seconds, a 503 is returned to the client.
+async fn get_server_for_client(
+    Path(uuid): Path<String>,
+    State(state): State<Arc<AppState>>,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    // 1. Look up the client_server_mappings table.
+    let mapping = database::get_server_for_client_uuid(&state.db, &uuid)
+        .await
+        .map_err(|e| {
+            error!("DB error looking up client UUID {}: {:?}", uuid, e);
+            (StatusCode::INTERNAL_SERVER_ERROR, "database error".to_string())
+        })?;
+
+    let mapping = match mapping {
+        Some(m) if m.allowed => m,
+        Some(_) => {
+            warn!("Client UUID {} is not allowed", uuid);
+            return Err((StatusCode::FORBIDDEN, "client not allowed".to_string()));
+        }
+        None => {
+            warn!("No server mapping found for client UUID {}", uuid);
+            return Err((StatusCode::NOT_FOUND, "no server mapping found".to_string()));
+        }
+    };
+
+    // 2. Find the server's management URL in config.
+    let server_cfg = state.config.servers.iter().find(|s| s.id == mapping.server_id);
+    let mgmt_url = match server_cfg {
+        Some(s) => s.mgmt_url.clone(),
+        None => {
+            error!(
+                "Server id {} from mapping not found in manager config",
+                mapping.server_id
+            );
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "server config not found".to_string(),
+            ));
+        }
+    };
+
+    // 3. Notify the server about the incoming client UUID (10-second timeout).
+    let pre_auth_url = format!("{}/api/manager/pre-auth", mgmt_url.trim_end_matches('/'));
+    let body = serde_json::json!({ "client_uuid": uuid });
+
+    let notify_result = tokio::time::timeout(
+        tokio::time::Duration::from_secs(10),
+        state.http_client.post(&pre_auth_url).json(&body).send(),
+    )
+    .await;
+
+    match notify_result {
+        Err(_) => {
+            warn!(
+                "Pre-auth notification to server {} timed out after 10s for UUID {}",
+                mapping.server_id, uuid
+            );
+            return Err((
+                StatusCode::SERVICE_UNAVAILABLE,
+                "server did not respond to pre-auth in time".to_string(),
+            ));
+        }
+        Ok(Err(e)) => {
+            error!(
+                "Failed to reach server {} mgmt API for pre-auth (UUID {}): {:?}",
+                mapping.server_id, uuid, e
+            );
+            return Err((
+                StatusCode::SERVICE_UNAVAILABLE,
+                "could not reach server management API".to_string(),
+            ));
+        }
+        Ok(Ok(resp)) => {
+            if !resp.status().is_success() {
+                warn!(
+                    "Server {} rejected pre-auth for UUID {}: HTTP {}",
+                    mapping.server_id,
+                    uuid,
+                    resp.status()
+                );
+                return Err((
+                    StatusCode::BAD_GATEWAY,
+                    "server rejected pre-auth".to_string(),
+                ));
+            }
+        }
+    }
+
+    info!(
+        "Pre-auth OK: client UUID {} assigned to server {} (client_id: {})",
+        mapping.client_uuid, mapping.server_id, mapping.client_id
+    );
+
+    Ok(Json(ServerAssignmentResponse {
+        server_id: mapping.server_id,
+    }))
+}
+
+// ── Multi-server assignment endpoint ─────────────────────────────────────────
+
+#[derive(Serialize)]
+struct ServerAssignmentsResponse {
+    server_ids: Vec<u32>,
+}
+
+/// `GET /api/client/:uuid/servers`
+///
+/// Returns **all** server_ids the client should connect to, based on which
+/// VPS servers currently have tunnels assigned to it.  Sends pre-auth
+/// notifications to all of those servers concurrently so the client can
+/// establish connections to all of them in parallel.
+///
+/// Falls back to the single mapping in `client_server_mappings` when no
+/// tunnel-based assignment exists yet.
+async fn get_servers_for_client(
+    Path(uuid): Path<String>,
+    State(state): State<Arc<AppState>>,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    // 1. Resolve client_id and check allowed flag.
+    //    Try client_server_mappings first; fall back to manager config by UUID.
+    let (client_id, fallback_server_id) = {
+        let db_row = database::get_server_for_client_uuid(&state.db, &uuid)
+            .await
+            .map_err(|e| {
+                error!("DB error looking up UUID {}: {:?}", uuid, e);
+                (StatusCode::INTERNAL_SERVER_ERROR, "database error".to_string())
+            })?;
+
+        match db_row {
+            Some(m) if !m.allowed => {
+                warn!("Client UUID {} is not allowed", uuid);
+                return Err((StatusCode::FORBIDDEN, "client not allowed".to_string()));
+            }
+            Some(m) => (m.client_id, Some(m.server_id)),
+            None => {
+                // Not in DB yet – look up by UUID in manager config (before first sync).
+                match state.config.clients.iter().find(|c| c.uuid.as_deref() == Some(&uuid)) {
+                    Some(c) => (c.id.clone(), None),
+                    None => {
+                        warn!("No mapping found for client UUID {}", uuid);
+                        return Err((StatusCode::NOT_FOUND, "no server mapping found".to_string()));
+                    }
+                }
+            }
+        }
+    };
+
+    // 2. Determine which servers this client needs to connect to.
+    let mut server_ids = database::get_servers_for_client(&state.db, &client_id)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    // Fallback: client has no tunnels with a server_id yet (bootstrap — first connection
+    // before any tunnel has been created / assigned a VPS server).
+    // We do NOT fall back when the client previously had tunnels that were deleted:
+    // in that case we intentionally return [] so the client disconnects from servers
+    // it no longer has any work to do on.
+    if server_ids.is_empty() {
+        // Count all tunnels for this client (includes stopped/offline ones).
+        // Zero → genuine bootstrap; non-zero means server_id is NULL for all tunnels,
+        // or they were recently deleted — either way, use the fallback to keep the
+        // client reachable so new tunnels can be assigned.
+        let tunnel_count: i64 = sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM tunnels WHERE client_id = ?",
+        )
+        .bind(&client_id)
+        .fetch_one(&state.db)
+        .await
+        .unwrap_or(0);
+
+        if tunnel_count == 0 {
+            // Bootstrap: no tunnels exist yet — fall back to configured server so the
+            // client is ready to receive new tunnel assignments immediately.
+            if let Some(sid) = fallback_server_id {
+                server_ids.push(sid);
+            } else if let Some(s) = state.config.servers.first() {
+                server_ids.push(s.id);
+            } else {
+                return Err((StatusCode::SERVICE_UNAVAILABLE, "no servers configured".to_string()));
+            }
+        }
+        // else: tunnels exist (or existed) but none have a known server_id right now.
+        // Return empty list — the client will disconnect and reconnect once tunnel
+        // assignments carry a server_id again.
+    }
+
+    // 3. Send pre-auth to all servers concurrently (best-effort: we always
+    //    return the full list; the client handles individual auth failures).
+    let tasks: Vec<_> = server_ids
+        .iter()
+        .filter_map(|&sid| {
+            let cfg = state.config.servers.iter().find(|s| s.id == sid)?;
+            let url = format!("{}/api/manager/pre-auth", cfg.mgmt_url.trim_end_matches('/'));
+            let body = serde_json::json!({ "client_uuid": uuid });
+            let http = state.http_client.clone();
+            let uuid_c = uuid.clone();
+            Some((sid, tokio::spawn(async move {
+                tokio::time::timeout(
+                    tokio::time::Duration::from_secs(10),
+                    http.post(&url).json(&body).send(),
+                )
+                .await
+                .map(|r| r.map(|resp| (resp.status().is_success(), uuid_c)))
+            })))
+        })
+        .collect();
+
+    for (sid, task) in tasks {
+        match task.await {
+            Ok(Ok(Ok((true, ref u)))) => {
+                info!("Pre-auth OK: client UUID {} → server {}", u, sid);
+            }
+            Ok(Ok(Ok((false, _)))) => {
+                warn!("Server {} rejected pre-auth for UUID {}", sid, uuid);
+            }
+            Ok(Ok(Err(e))) => {
+                warn!("Could not reach server {} mgmt for UUID {}: {:?}", sid, uuid, e);
+            }
+            Ok(Err(_)) => {
+                warn!("Pre-auth timed out for server {} (UUID {})", sid, uuid);
+            }
+            Err(e) => {
+                warn!("Pre-auth task panicked for server {}: {:?}", sid, e);
+            }
+        }
+    }
+
+    info!(
+        "Servers for client UUID {} ({}): {:?}",
+        uuid, client_id, server_ids
+    );
+
+    Ok(Json(ServerAssignmentsResponse { server_ids }))
 }

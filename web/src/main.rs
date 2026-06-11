@@ -143,7 +143,7 @@ fn default_true() -> bool { true }
 struct UpdateTunnelRequest {
     name: Option<String>, server_ip: Option<String>, server_port: Option<u16>,
     remote_port: Option<u16>, protocol: Option<String>, subdomain: Option<String>,
-    domain: Option<String>, online: Option<bool>, server_id: Option<i64>,
+    domain: Option<String>, online: Option<bool>, server_id: Option<u32>,
     client_id: Option<String>,
     create_srv: Option<bool>,
 }
@@ -192,11 +192,14 @@ async fn create_tunnel(State(state): State<Arc<AppState>>, Json(req): Json<Creat
     };
 
     // Read all existing IDs into a HashSet, then find the lowest free one in Rust.
-    // Avoids MySQL BIGINT type-casting issues that arise from arithmetic on id columns.
-    let taken: HashSet<u32> = match sqlx::query_scalar("SELECT id FROM tunnels")
+    // Use i64 for the query scalar so sqlx can decode any MySQL integer column
+    // (INT, INT UNSIGNED, BIGINT, …) without a type-mismatch error.
+    // When tunnels.id is INT (signed), using u32 here fails on any non-empty
+    // table because sqlx cannot widen a signed type into u32.
+let taken: HashSet<u32> = match sqlx::query_scalar::<_, i64>("SELECT id FROM tunnels")
         .fetch_all(&mut *tx).await
     {
-        Ok(ids) => ids.into_iter().collect(),
+        Ok(ids) => ids.into_iter().filter_map(|n| if n > 0 { Some(n as u32) } else { None }).collect(),
         Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, format!("{}", e)).into_response(),
     };
     // (1u32..) is infinite so unwrap_or is unreachable, but keeps the type checker happy.
@@ -288,7 +291,16 @@ async fn delete_tunnel(State(state): State<Arc<AppState>>, Path(id): Path<u32>) 
 }
 
 async fn start_tunnel(State(state): State<Arc<AppState>>, Path(id): Path<u32>) -> impl IntoResponse {
-    match sqlx::query("UPDATE tunnels SET online = TRUE WHERE id = ?").bind(id).execute(&state.db).await {
+    // Reset dns_set so the manager re-configures DNS (server may have changed),
+    // and reset client_id so the manager re-assigns the tunnel to a client.
+    // tunnel_status is set to 'starting' so the UI shows transitional state.
+    match sqlx::query(
+        "UPDATE tunnels SET online = TRUE, client_id = NULL, dns_set = FALSE, tunnel_status = 'starting' WHERE id = ?",
+    )
+    .bind(id)
+    .execute(&state.db)
+    .await
+    {
         Ok(_) => Json(serde_json::json!({"message": "Started"})).into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("{}", e)).into_response(),
     }

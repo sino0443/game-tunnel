@@ -1,6 +1,10 @@
 use anyhow::{Context, Result};
+use axum::extract::State;
+use axum::routing::post;
+use axum::{Json, Router};
 use game_tunnel_shared::config::ServerConfig;
 use game_tunnel_shared::protocol::{self, Frame, Message, TunnelProtocol};
+use serde::Deserialize;
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::BufReader;
@@ -8,6 +12,7 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::time::Instant;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::{mpsc, watch, RwLock};
@@ -17,10 +22,24 @@ use tracing::{debug, error, info, warn};
 
 static STREAM_ID_COUNTER: AtomicU64 = AtomicU64::new(1);
 static ACTIVE_CONNECTIONS: AtomicUsize = AtomicUsize::new(0);
-const MAX_CONNECTIONS: usize = 50;
+const MAX_CONNECTIONS: usize = 200;
 const CLIENT_IDLE_TIMEOUT_SECS: u64 = 30;
-/// UDP-Sessions werden nach dieser Zeit ohne Aktivität bereinigt.
-const UDP_SESSION_TIMEOUT_SECS: u64 = 30;
+/// UDP sessions are cleaned up after this period of inactivity.
+/// 60 s gives games with long idle phases (Satisfactory, ARK, Valheim) time
+/// to resume without forcing a new UDP session allocation.
+const UDP_SESSION_TIMEOUT_SECS: u64 = 60;
+/// Socket send/receive buffer size for game connections.
+/// 256 KB is large enough for most game update bursts while keeping
+/// per-connection overhead low.
+const SOCKET_BUF_SIZE: usize = 256 * 1024;
+/// Pre-auth cache entries expire after 10 seconds.
+/// The client must connect within this window after the manager sends the
+/// pre-auth notification, otherwise the connection will be rejected.
+const PRE_AUTH_TTL_SECS: u64 = 10;
+
+/// In-memory pre-auth cache: maps client UUID → timestamp of when the
+/// manager granted the pre-authorization.
+type PreAuthCache = Arc<RwLock<HashMap<String, Instant>>>;
 
 struct ActiveTunnel {
     #[allow(dead_code)] tunnel_id: u32,
@@ -51,12 +70,16 @@ fn load_tls_config(cert_path: &str, key_path: &str) -> Result<Arc<rustls::Server
 }
 
 fn is_valid_game_port(port: u16) -> bool {
+    // Explicitly allow HTTP (80) and HTTPS (443) so plain TCP tunnels can
+    // carry web traffic without needing a dedicated proxy.
+    if port == 80 || port == 443 { return true; }
+    // Block other privileged ports and the server's own management ports.
     if port < 1024 { return false; }
     if port == 9000 || port == 9001 { return false; }
     true
 }
 
-fn apply_keepalive(stream: &TcpStream) {
+fn apply_socket_options(stream: &TcpStream) {
     use std::time::Duration;
     let sock_ref = socket2::SockRef::from(stream);
     let keepalive = socket2::TcpKeepalive::new()
@@ -66,7 +89,72 @@ fn apply_keepalive(stream: &TcpStream) {
     if let Err(e) = sock_ref.set_tcp_keepalive(&keepalive) {
         warn!("Failed to set TCP keepalive: {:?}", e);
     }
+    // Larger send/receive buffers improve throughput for game traffic bursts.
+    if let Err(e) = sock_ref.set_send_buffer_size(SOCKET_BUF_SIZE) {
+        warn!("Failed to set SO_SNDBUF: {:?}", e);
+    }
+    if let Err(e) = sock_ref.set_recv_buffer_size(SOCKET_BUF_SIZE) {
+        warn!("Failed to set SO_RCVBUF: {:?}", e);
+    }
 }
+
+// ── Management HTTP server ───────────────────────────────────────────────────
+
+#[derive(Deserialize)]
+struct PreAuthRequest {
+    client_uuid: String,
+}
+
+/// Handler for `POST /api/manager/pre-auth`.
+///
+/// Called by the manager to notify the server that a client with the given
+/// UUID is expected to connect within the next `PRE_AUTH_TTL_SECS` seconds.
+async fn handle_pre_auth_request(
+    State(cache): State<PreAuthCache>,
+    Json(req): Json<PreAuthRequest>,
+) -> axum::http::StatusCode {
+    let mut c = cache.write().await;
+    c.insert(req.client_uuid.clone(), Instant::now());
+    info!("Pre-auth stored for client UUID {} (TTL: {}s)", req.client_uuid, PRE_AUTH_TTL_SECS);
+    axum::http::StatusCode::OK
+}
+
+/// Starts the management HTTP server that listens for pre-auth notifications
+/// from the manager. This runs in a background task.
+async fn start_mgmt_server(bind_addr: String, cache: PreAuthCache) {
+    let app = Router::new()
+        .route("/api/manager/pre-auth", post(handle_pre_auth_request))
+        .with_state(cache);
+
+    info!("Server management API listening on {}", bind_addr);
+    match tokio::net::TcpListener::bind(&bind_addr).await {
+        Ok(listener) => {
+            if let Err(e) = axum::serve(listener, app).await {
+                error!("Management server error: {:?}", e);
+            }
+        }
+        Err(e) => {
+            error!("Failed to bind management API on {}: {:?}", bind_addr, e);
+        }
+    }
+}
+
+/// Background task: removes expired pre-auth entries every 5 seconds.
+async fn cleanup_pre_auth_cache(cache: PreAuthCache) {
+    let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(5));
+    loop {
+        interval.tick().await;
+        let mut c = cache.write().await;
+        let before = c.len();
+        c.retain(|_, ts| ts.elapsed().as_secs() < PRE_AUTH_TTL_SECS + 5);
+        let removed = before - c.len();
+        if removed > 0 {
+            debug!("Pre-auth cache cleanup: removed {} expired entries", removed);
+        }
+    }
+}
+
+// ── Main ─────────────────────────────────────────────────────────────────────
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -81,7 +169,19 @@ async fn main() -> Result<()> {
     info!("Loading TLS certificate from {}", config.tls_cert);
     let tls_acceptor = TlsAcceptor::from(load_tls_config(&config.tls_cert, &config.tls_key)?);
 
-    info!("Starting game-tunnel server on {}", config.bind_address);
+    // Shared pre-auth cache: populated by manager, consumed on client connect.
+    let pre_auth_cache: PreAuthCache = Arc::new(RwLock::new(HashMap::new()));
+
+    // Start management HTTP server so manager can push pre-auth entries.
+    let mgmt_cache = Arc::clone(&pre_auth_cache);
+    let mgmt_addr = config.mgmt_bind_address.clone();
+    tokio::spawn(start_mgmt_server(mgmt_addr, mgmt_cache));
+
+    // Periodically remove expired cache entries.
+    let cleanup_cache = Arc::clone(&pre_auth_cache);
+    tokio::spawn(cleanup_pre_auth_cache(cleanup_cache));
+
+    info!("Starting game-tunnel server {} on {}", config.server_id, config.bind_address);
     let listener = TcpListener::bind(&config.bind_address).await
         .with_context(|| format!("failed to bind {}", config.bind_address))?;
 
@@ -90,7 +190,7 @@ async fn main() -> Result<()> {
     loop {
         let (tcp_stream, addr) = listener.accept().await?;
         tcp_stream.set_nodelay(true).ok();
-        apply_keepalive(&tcp_stream);
+        apply_socket_options(&tcp_stream);
 
         let conn_count = ACTIVE_CONNECTIONS.fetch_add(1, Ordering::Relaxed);
         if conn_count >= MAX_CONNECTIONS {
@@ -103,21 +203,47 @@ async fn main() -> Result<()> {
         let acceptor = tls_acceptor.clone();
         let config = config.clone();
         let public_bind = public_bind.clone();
+        let cache = Arc::clone(&pre_auth_cache);
 
         tokio::spawn(async move {
             match acceptor.accept(tcp_stream).await {
                 Ok(tls_stream) => {
                     info!("Client {} TLS handshake complete", addr);
-                    if let Err(e) = handle_client(tls_stream, addr, &config, &public_bind).await {
+                    if let Err(e) = handle_client(tls_stream, addr, &config, &public_bind, cache).await {
                         let msg = e.to_string();
-                        if !msg.contains("close_notify") && !msg.contains("peer closed") && !msg.contains("idle timeout") {
+                        if msg.contains("close_notify") || msg.contains("peer closed") || msg.contains("idle timeout") {
+                            // Expected disconnects – silent.
+                        } else if msg.contains("malformed auth frame")
+                            || msg.contains("expected Auth frame")
+                            || msg.contains("authentication timeout")
+                            || msg.contains("authentication failed")
+                            || msg.contains("pre-auth expired")
+                            || msg.contains("not pre-authorized")
+                            || msg.contains("Auth payload")
+                        {
+                            // Auth rejections are expected (e.g. external scanners,
+                            // expired pre-auth, wrong secret) – log as WARN, not ERROR.
+                            warn!("Client {} auth rejected: {}", addr, msg);
+                        } else {
                             error!("Client {} error: {:?}", addr, e);
                         }
                     }
                 }
                 Err(e) => {
                     let msg = e.to_string();
-                    if !msg.contains("InvalidContentType") && !msg.contains("close_notify") && !msg.contains("UnknownIssuer") {
+                    // These are all expected from external scanners / probes and
+                    // produce nothing actionable — suppress or downgrade them.
+                    let scanner_noise = msg.contains("InvalidContentType")
+                        || msg.contains("close_notify")
+                        || msg.contains("UnknownIssuer")
+                        // TLS 1.2 probe against a TLS-1.3-only server.
+                        || msg.contains("Tls12NotOffered")
+                        || msg.contains("PeerIncompatible")
+                        // Scanner drops the TCP connection immediately.
+                        || msg.contains("Connection reset by peer")
+                        || msg.contains("ConnectionReset")
+                        || msg.contains("code: 104");
+                    if !scanner_noise {
                         error!("TLS handshake failed for {}: {:?}", addr, e);
                     }
                 }
@@ -130,29 +256,81 @@ async fn main() -> Result<()> {
 
 async fn handle_client(
     stream: tokio_rustls::server::TlsStream<TcpStream>,
-    addr: SocketAddr, config: &ServerConfig, public_bind: &str,
+    addr: SocketAddr,
+    config: &ServerConfig,
+    public_bind: &str,
+    pre_auth_cache: PreAuthCache,
 ) -> Result<()> {
     let (mut read_half, mut write_half) = tokio::io::split(stream);
 
     let frame = match tokio::time::timeout(tokio::time::Duration::from_secs(10), protocol::read_frame(&mut read_half)).await {
         Ok(Ok(f)) => f,
-        Ok(Err(e)) => return Err(e.into()),
+        Ok(Err(e)) => {
+            // Malformed frame – inform the client before closing so it knows
+            // why the connection was rejected (prevents silent EOF reconnect loops).
+            let _ = protocol::write_control(
+                &mut write_half,
+                &Message::AuthFailed { reason: "malformed auth frame".into() },
+            ).await;
+            return Err(e.into());
+        }
         Err(_) => { warn!("Auth timeout for {}", addr); anyhow::bail!("authentication timeout"); }
     };
 
     match frame {
-        Frame::Control(Message::Auth { secret }) => {
-            let expected = config.secret.as_bytes(); let provided = secret.as_bytes();
-            let valid = expected.len() == provided.len() &&
-                expected.iter().zip(provided.iter()).fold(0u8, |acc, (a, b)| acc | (a ^ b)) == 0;
+        Frame::Control(Message::Auth { secret, client_uuid }) => {
+            // 1. Constant-time secret check.
+            let expected = config.secret.as_bytes();
+            let provided = secret.as_bytes();
+            let valid = expected.len() == provided.len()
+                && expected.iter().zip(provided.iter()).fold(0u8, |acc, (a, b)| acc | (a ^ b)) == 0;
             if !valid {
                 protocol::write_control(&mut write_half, &Message::AuthFailed { reason: "invalid secret".into() }).await?;
-                warn!("Auth failed from {}", addr); anyhow::bail!("authentication failed");
+                warn!("Auth failed (bad secret) from {}", addr);
+                anyhow::bail!("authentication failed");
             }
+
+            // 2. If a UUID is provided, verify against the pre-auth cache.
+            //    The manager must have sent a pre-auth notification (within the
+            //    last PRE_AUTH_TTL_SECS seconds) for this UUID to be accepted.
+            if let Some(ref uuid) = client_uuid {
+                let mut cache = pre_auth_cache.write().await;
+                match cache.get(uuid).cloned() {
+                    Some(ts) if ts.elapsed().as_secs() < PRE_AUTH_TTL_SECS => {
+                        // Valid — consume the entry (one-time use per connection).
+                        cache.remove(uuid);
+                        info!("Client {} authenticated with UUID {} (pre-auth valid)", addr, uuid);
+                    }
+                    Some(_) => {
+                        cache.remove(uuid);
+                        protocol::write_control(
+                            &mut write_half,
+                            &Message::AuthFailed { reason: "pre-auth expired".into() },
+                        ).await?;
+                        warn!("Client {} UUID {} pre-auth expired (>{}s)", addr, uuid, PRE_AUTH_TTL_SECS);
+                        anyhow::bail!("pre-auth expired");
+                    }
+                    None => {
+                        protocol::write_control(
+                            &mut write_half,
+                            &Message::AuthFailed { reason: "not pre-authorized by manager".into() },
+                        ).await?;
+                        warn!("Client {} UUID {} not in pre-auth cache", addr, uuid);
+                        anyhow::bail!("not pre-authorized");
+                    }
+                }
+            }
+
             protocol::write_control(&mut write_half, &Message::AuthOk).await?;
-            info!("Client {} authenticated", addr);
+            info!("Client {} authenticated (server_id: {})", addr, config.server_id);
         }
-        _ => anyhow::bail!("expected Auth frame"),
+        _ => {
+            let _ = protocol::write_control(
+                &mut write_half,
+                &Message::AuthFailed { reason: "expected auth frame".into() },
+            ).await;
+            anyhow::bail!("expected Auth frame");
+        }
     }
 
     let state = Arc::new(RwLock::new(ServerState {
@@ -247,7 +425,7 @@ async fn handle_control_message(
                         res = listener.accept() => { match res {
                             Ok((player_stream, peer)) => {
                                 player_stream.set_nodelay(true).ok();
-                                apply_keepalive(&player_stream);
+                                apply_socket_options(&player_stream);
                                 let stream_id = STREAM_ID_COUNTER.fetch_add(1, Ordering::Relaxed);
                                 debug!("Player {} connected (stream {} TCP)", peer, stream_id);
                                 let (player_tx, player_rx) = mpsc::channel::<Vec<u8>>(2048);
@@ -280,11 +458,8 @@ async fn handle_control_message(
                 tokio::spawn(async move {
                     let mut buf = vec![0u8; 65535];
                     let mut peer_streams: HashMap<std::net::SocketAddr, u64> = HashMap::new();
-                    // Zeitstempel der letzten Aktivität pro Peer für Session-Cleanup.
                     let mut last_seen: HashMap<std::net::SocketAddr, std::time::Instant> = HashMap::new();
-                    let mut cleanup_interval = tokio::time::interval(
-                        tokio::time::Duration::from_secs(10)
-                    );
+                    let mut cleanup_interval = tokio::time::interval(tokio::time::Duration::from_secs(10));
                     loop { tokio::select! {
                         res = socket.recv_from(&mut buf) => { match res {
                             Ok((len, peer_addr)) => {
@@ -301,9 +476,6 @@ async fn handle_control_message(
                             Err(e) => { error!("UDP recv error: {:?}", e); break; }
                         }}
                         _ = cleanup_interval.tick() => {
-                            // Peers ohne Aktivität seit UDP_SESSION_TIMEOUT_SECS bereinigen.
-                            // Bedrock sendet kein explizites Disconnect — dieser Timeout
-                            // räumt stale Sessions auf damit Reconnects sauber funktionieren.
                             let now = std::time::Instant::now();
                             let stale: Vec<std::net::SocketAddr> = last_seen.iter()
                                 .filter(|(_, t)| now.duration_since(**t).as_secs() > UDP_SESSION_TIMEOUT_SECS)
