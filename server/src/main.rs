@@ -461,10 +461,7 @@ async fn handle_control_message(
                     let mut buf = vec![0u8; 65535];
                     let mut peer_streams: HashMap<std::net::SocketAddr, u64> = HashMap::new();
                     let mut last_seen: HashMap<std::net::SocketAddr, std::time::Instant> = HashMap::new();
-                    let mut cleanup_interval  = tokio::time::interval(tokio::time::Duration::from_secs(10));
-                    // Keep-alive: sends a minimal UDP packet back to the player every 5 s so
-                    // aggressive NAT/CGNAT entries don't expire between game packets.
-                    let mut keepalive_interval = tokio::time::interval(tokio::time::Duration::from_secs(5));
+                    let mut cleanup_interval = tokio::time::interval(tokio::time::Duration::from_secs(10));
                     loop { tokio::select! {
                         res = socket.recv_from(&mut buf) => { match res {
                             Ok((len, peer_addr)) => {
@@ -525,15 +522,6 @@ async fn handle_control_message(
                                     let _ = write_tx_udp.send(Frame::StreamClose { stream_id: sid }).await;
                                     info!("UDP: stale session removed for {} (stream {})", addr, sid);
                                 }
-                            }
-                        }
-                        _ = keepalive_interval.tick() => {
-                            // Send a 1-byte keepalive to every active peer so their NAT
-                            // entries stay alive between real game packets.  UE5 and most
-                            // game engines silently discard packets that don't match the
-                            // expected frame format, so this is harmless.
-                            for (addr, _) in &peer_streams {
-                                let _ = socket.send_to(&[0u8], *addr).await;
                             }
                         }
                         _ = shutdown.changed() => { info!("Shutting down port {} (UDP)", remote_port); break; }
