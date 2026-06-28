@@ -873,8 +873,13 @@ async function save(){
     server_port:+document.getElementById('f-sport').value,
     remote_port:+document.getElementById('f-rport').value,
     protocol:document.getElementById('f-proto').value,
-    server_id:sid?+sid:null,
-    client_id:cid||null,
+    // For PUT (edit): use sentinels so the backend can distinguish
+    //   "no change" (when the field is absent) from "clear to NULL".
+    //   -1 → update_tunnel sets server_id = NULL
+    //   '-' → update_tunnel sets client_id = NULL
+    // For POST (create): null is fine (Option<u32> / Option<String> → None).
+    server_id: id ? (sid ? +sid : -1) : (sid ? +sid : null),
+    client_id: id ? (cid || '-') : (cid || null),
     create_srv:document.getElementById('f-srv').checked,
   };
   const resp=await fetch(id?API+'/api/tunnels/'+id:API+'/api/tunnels',
