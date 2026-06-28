@@ -656,7 +656,6 @@ async fn sync_tunnels_from_db(
                         "both" => TunnelProtocol::Both,
                         _ => TunnelProtocol::Tcp,
                     },
-                    db_id: dbt.id,
                 })).await;
             } else {
                 continue;
@@ -713,7 +712,6 @@ async fn sync_tunnels_from_db(
                         "both" => TunnelProtocol::Both,
                         _ => TunnelProtocol::Tcp,
                     },
-                    db_id: dbt.id,
                 })).await.is_err() { continue; }
             } else { continue; }
         }
@@ -962,12 +960,15 @@ async fn handle_local_udp_stream(
         }
     });
     let sw = Arc::clone(&socket);
-    // 35s inactivity timeout — Bedrock sends no explicit disconnect, so we
-    // close the session ourselves after 35s of silence.
+    // 120s inactivity timeout — no data from the game server to the player.
+    // Raised from 35s to 120s so that games with long map-loading phases
+    // (Satisfactory, ARK) don't lose their session while the player is still
+    // loading.  Bedrock and other games that don't send explicit disconnects
+    // will have stale sessions cleaned up after 2 minutes instead of 35s.
     let write_task = tokio::spawn(async move {
         loop {
             match tokio::time::timeout(
-                tokio::time::Duration::from_secs(35),
+                tokio::time::Duration::from_secs(120),
                 from_tunnel.recv(),
             ).await {
                 Ok(Some(data)) => {
@@ -979,7 +980,7 @@ async fn handle_local_udp_stream(
                 }
                 Ok(None) => break,
                 Err(_) => {
-                    info!("UDP stream {}: 35s inactivity timeout, closing", stream_id);
+                    info!("UDP stream {}: 120s inactivity timeout, closing", stream_id);
                     break;
                 }
             }
