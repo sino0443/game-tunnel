@@ -70,6 +70,30 @@ async fn basic_auth_middleware(
     (StatusCode::UNAUTHORIZED, [(header::WWW_AUTHENTICATE, "Basic realm=\"Game Tunnel Manager\"")], "Unauthorized").into_response()
 }
 
+/// Ensures all columns the web server reads or writes exist in the `tunnels`
+/// table.  The manager normally adds these via its own `ensure_columns`, but
+/// the web server may start before (or without) the manager.  Running this at
+/// startup is idempotent — duplicate-column errors are silently ignored.
+async fn ensure_web_columns(pool: &MySqlPool) -> Result<()> {
+    let columns: &[(&str, &str)] = &[
+        ("create_srv",    "BOOLEAN NOT NULL DEFAULT TRUE"),
+        ("client_id",     "VARCHAR(50) DEFAULT NULL"),
+        ("tunnel_status", "VARCHAR(20) NOT NULL DEFAULT 'stopped'"),
+        ("last_seen",     "DATETIME DEFAULT NULL"),
+        ("dns_set",       "BOOLEAN NOT NULL DEFAULT FALSE"),
+    ];
+    for (col, def) in columns {
+        let sql = format!("ALTER TABLE tunnels ADD COLUMN {} {}", col, def);
+        if let Err(e) = sqlx::query(&sql).execute(pool).await {
+            if !e.to_string().contains("Duplicate column") {
+                tracing::warn!("Column check for '{}': {:?}", col, e);
+            }
+        }
+    }
+    info!("DB columns verified");
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt().with_env_filter(
@@ -86,6 +110,7 @@ async fn main() -> Result<()> {
     let db_url = format!("mysql://{}:{}@{}:{}/{}", config.database.user, config.database.password, config.database.host, config.database.port, config.database.database);
     let pool = MySqlPoolOptions::new().max_connections(10).connect(&db_url).await.context("failed to connect to MySQL")?;
     info!("Connected to MySQL");
+    ensure_web_columns(&pool).await?;
 
     let http_client = reqwest::Client::builder().timeout(std::time::Duration::from_secs(5)).build()?;
     let domains: Vec<String> = config.cloudflare.zones.iter().map(|z| z.domain.clone()).collect();
@@ -143,7 +168,7 @@ fn default_true() -> bool { true }
 struct UpdateTunnelRequest {
     name: Option<String>, server_ip: Option<String>, server_port: Option<u16>,
     remote_port: Option<u16>, protocol: Option<String>, subdomain: Option<String>,
-    domain: Option<String>, online: Option<bool>, server_id: Option<u32>,
+    domain: Option<String>, online: Option<bool>, server_id: Option<i32>,
     client_id: Option<String>,
     create_srv: Option<bool>,
 }
