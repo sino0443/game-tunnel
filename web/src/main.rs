@@ -129,6 +129,8 @@ async fn main() -> Result<()> {
         .route("/api/tunnels/{id}", delete(delete_tunnel))
         .route("/api/tunnels/{id}/start", post(start_tunnel))
         .route("/api/tunnels/{id}/stop", post(stop_tunnel))
+        .route("/api/tunnels/{id}/connections", get(proxy_tunnel_connections))
+        .route("/api/tunnels/{id}/connections/{stream_id}", delete(proxy_disconnect_connection))
         .route("/api/domains", get(move || async move { Json(domains_clone.clone()) }))
         .route("/api/stats", get(proxy_stats))
         .route("/api/clients", get(proxy_clients))
@@ -369,4 +371,41 @@ async fn proxy_clients(State(state): State<Arc<AppState>>) -> impl IntoResponse 
 
 async fn index_page() -> Html<&'static str> {
     Html(include_str!("index.html"))
+}
+
+/// `GET /api/tunnels/{id}/connections`
+async fn proxy_tunnel_connections(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<u32>,
+) -> impl IntoResponse {
+    let Some(ref url) = state.manager_url else {
+        return Json(serde_json::json!([])).into_response();
+    };
+    match state.http_client.get(&format!("{}/api/tunnels/{}/connections", url, id)).send().await {
+        Ok(resp) => match resp.json::<serde_json::Value>().await {
+            Ok(json) => Json(json).into_response(),
+            Err(e) => (StatusCode::BAD_GATEWAY, format!("parse error: {}", e)).into_response(),
+        },
+        Err(e) => (StatusCode::BAD_GATEWAY, format!("manager unavailable: {}", e)).into_response(),
+    }
+}
+
+/// `DELETE /api/tunnels/{id}/connections/{stream_id}`
+async fn proxy_disconnect_connection(
+    State(state): State<Arc<AppState>>,
+    Path((id, stream_id)): Path<(u32, u64)>,
+) -> impl IntoResponse {
+    let Some(ref url) = state.manager_url else {
+        return (StatusCode::SERVICE_UNAVAILABLE, "manager_url not configured").into_response();
+    };
+    match state.http_client
+        .delete(&format!("{}/api/tunnels/{}/connections/{}", url, id, stream_id))
+        .send().await
+    {
+        Ok(resp) => match resp.json::<serde_json::Value>().await {
+            Ok(json) => Json(json).into_response(),
+            Err(e) => (StatusCode::BAD_GATEWAY, format!("parse error: {}", e)).into_response(),
+        },
+        Err(e) => (StatusCode::BAD_GATEWAY, format!("manager unavailable: {}", e)).into_response(),
+    }
 }

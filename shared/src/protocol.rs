@@ -32,10 +32,16 @@ pub enum Message {
     /// Server rejects authentication.
     AuthFailed { reason: String },
     /// Client requests a tunnel to be opened.
+    /// `db_id` is the database row id of the tunnel — carried so the server
+    /// can expose it in its connection-tracking API without needing a separate
+    /// lookup.  Encoded as the last 4 bytes of the wire payload so that old
+    /// servers that only expect 7 bytes still work (they just won't see db_id).
     OpenTunnel {
         tunnel_id: u32,
         remote_port: u16,
         protocol: TunnelProtocol,
+        /// Database id of the tunnel (0 = unknown / legacy).
+        db_id: u32,
     },
     /// Server confirms tunnel is open.
     TunnelOpened { tunnel_id: u32 },
@@ -103,11 +109,15 @@ impl Message {
                 tunnel_id,
                 remote_port,
                 protocol,
+                db_id,
             } => {
-                let mut buf = Vec::with_capacity(7);
+                // Wire format: tunnel_id(4) + remote_port(2) + protocol(1) + db_id(4) = 11 bytes.
+                // Old servers that only expect 7 bytes will ignore the trailing db_id.
+                let mut buf = Vec::with_capacity(11);
                 buf.extend_from_slice(&tunnel_id.to_be_bytes());
                 buf.extend_from_slice(&remote_port.to_be_bytes());
                 buf.push(*protocol as u8);
+                buf.extend_from_slice(&db_id.to_be_bytes());
                 (MSG_OPEN_TUNNEL, buf)
             }
             Message::TunnelOpened { tunnel_id } => {
@@ -183,10 +193,17 @@ impl Message {
                     3 => TunnelProtocol::Both,
                     other => anyhow::bail!("unknown protocol: {}", other),
                 };
+                // db_id is optional (new field) — default 0 for legacy senders.
+                let db_id = if payload.len() >= 11 {
+                    u32::from_be_bytes(payload[7..11].try_into()?)
+                } else {
+                    0
+                };
                 Ok(Message::OpenTunnel {
                     tunnel_id,
                     remote_port,
                     protocol,
+                    db_id,
                 })
             }
             MSG_TUNNEL_OPENED => {

@@ -4,7 +4,7 @@ use axum::Router;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Json};
-use axum::routing::get;
+use axum::routing::{delete, get};
 use game_tunnel_shared::config::{CloudflareConfig, ManagerConfig};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -17,10 +17,41 @@ use tracing::{error, info, warn};
 mod cloudflare;
 mod database;
 
+/// Deserialized from the server's `GET /api/connections` mgmt endpoint.
+#[derive(Deserialize, Clone)]
+struct ServerConnData {
+    stream_id: u64,
+    db_id: u32,
+    #[allow(dead_code)] tunnel_id: u32,
+    peer_ip: String,
+    bytes_in: u64,
+    bytes_out: u64,
+    bytes_in_per_sec: u64,
+    bytes_out_per_sec: u64,
+    connected_secs: u64,
+}
+
+/// Per-connection info exposed by the manager's tunnel-connections endpoint.
+#[derive(Serialize, Clone)]
+struct TunnelConnInfo {
+    stream_id: u64,
+    peer_ip: String,
+    bytes_in: u64,
+    bytes_out: u64,
+    bytes_in_per_sec: u64,
+    bytes_out_per_sec: u64,
+    connected_secs: u64,
+}
+
 #[derive(Clone, Default)]
 struct ManagerState {
     tunnels: Vec<TunnelInfo>,
     clients: Vec<ClientInfo>,
+    /// Active player connections grouped by tunnel db_id.
+    connections_by_db_id: HashMap<u32, Vec<TunnelConnInfo>>,
+    /// Maps stream_id → server_id so the disconnect handler knows which
+    /// server to forward the DELETE to.
+    stream_server_map: HashMap<u64, u32>,
 }
 
 #[derive(Clone, Serialize)]
@@ -127,12 +158,14 @@ async fn main() -> Result<()> {
     });
 
     let app = Router::new()
-        .route("/api/stats", get(get_stats))
+        .route("/api/stats",   get(get_stats))
         .route("/api/tunnels", get(get_tunnels))
         .route("/api/clients", get(get_clients))
-        // Client asks manager: "which server should I connect to?" (legacy single-server)
-        .route("/api/client/{uuid}/server", get(get_server_for_client))
-        // Client asks manager: "which servers do I need to connect to?" (multi-server)
+        .route("/api/tunnels/{db_id}/connections",
+               get(get_tunnel_connections))
+        .route("/api/tunnels/{db_id}/connections/{stream_id}",
+               delete(disconnect_tunnel_connection))
+        .route("/api/client/{uuid}/server",  get(get_server_for_client))
         .route("/api/client/{uuid}/servers", get(get_servers_for_client))
         .layer(CorsLayer::permissive())
         .with_state(state);
@@ -352,10 +385,40 @@ async fn refresh_stats(state: &Arc<AppState>) -> Result<()> {
         }
     }
 
+    // ── Poll active player connections from each server's mgmt API ──────────
+    let mut connections_by_db_id: HashMap<u32, Vec<TunnelConnInfo>> = HashMap::new();
+    let mut stream_server_map: HashMap<u64, u32> = HashMap::new();
+
+    for server in &state.config.servers {
+        let url = format!("{}/api/connections", server.mgmt_url.trim_end_matches('/'));
+        match state.http_client.get(&url).send().await {
+            Ok(resp) => match resp.json::<Vec<ServerConnData>>().await {
+                Ok(conns) => {
+                    for conn in conns {
+                        stream_server_map.insert(conn.stream_id, server.id);
+                        connections_by_db_id.entry(conn.db_id).or_default().push(TunnelConnInfo {
+                            stream_id:         conn.stream_id,
+                            peer_ip:           conn.peer_ip,
+                            bytes_in:          conn.bytes_in,
+                            bytes_out:         conn.bytes_out,
+                            bytes_in_per_sec:  conn.bytes_in_per_sec,
+                            bytes_out_per_sec: conn.bytes_out_per_sec,
+                            connected_secs:    conn.connected_secs,
+                        });
+                    }
+                }
+                Err(e) => warn!("Failed to parse connections from server '{}': {:?}", server.name, e),
+            },
+            Err(e) => warn!("Cannot reach server '{}' for connections: {:?}", server.name, e),
+        }
+    }
+
     let mut ms = state.manager_state.write().await;
     ms.tunnels = tunnel_map.into_values().collect();
     ms.tunnels.sort_by(|a, b| a.name.cmp(&b.name));
     ms.clients = client_infos;
+    ms.connections_by_db_id = connections_by_db_id;
+    ms.stream_server_map    = stream_server_map;
     Ok(())
 }
 
@@ -406,6 +469,45 @@ async fn get_tunnels(State(state): State<Arc<AppState>>) -> impl IntoResponse {
 
 async fn get_clients(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     Json(state.manager_state.read().await.clients.clone())
+}
+
+// ── Tunnel connection endpoints ──────────────────────────────────────────────
+
+/// `GET /api/tunnels/{db_id}/connections`
+async fn get_tunnel_connections(
+    State(state): State<Arc<AppState>>,
+    Path(db_id): Path<u32>,
+) -> impl IntoResponse {
+    let ms = state.manager_state.read().await;
+    let conns = ms.connections_by_db_id.get(&db_id).cloned().unwrap_or_default();
+    Json(conns)
+}
+
+/// `DELETE /api/tunnels/{db_id}/connections/{stream_id}`
+///
+/// Forwards a forced-disconnect request to the server that owns the stream.
+async fn disconnect_tunnel_connection(
+    State(state): State<Arc<AppState>>,
+    Path((_db_id, stream_id)): Path<(u32, u64)>,
+) -> impl IntoResponse {
+    let server_id = {
+        let ms = state.manager_state.read().await;
+        ms.stream_server_map.get(&stream_id).copied()
+    };
+    let Some(server_id) = server_id else {
+        return (StatusCode::NOT_FOUND, "connection not found").into_response();
+    };
+    let Some(server) = state.config.servers.iter().find(|s| s.id == server_id) else {
+        return (StatusCode::INTERNAL_SERVER_ERROR, "server config not found").into_response();
+    };
+    let url = format!("{}/api/connections/{}", server.mgmt_url.trim_end_matches('/'), stream_id);
+    match state.http_client.delete(&url).send().await {
+        Ok(resp) if resp.status().is_success() => {
+            Json(serde_json::json!({"message": "Disconnected"})).into_response()
+        }
+        Ok(resp) => (StatusCode::BAD_GATEWAY, format!("server returned {}", resp.status())).into_response(),
+        Err(e)   => (StatusCode::BAD_GATEWAY, format!("cannot reach server: {}", e)).into_response(),
+    }
 }
 
 // ── Client server-assignment endpoint ───────────────────────────────────────
