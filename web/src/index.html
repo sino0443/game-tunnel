@@ -265,19 +265,6 @@ tbody tr:hover{background:rgba(255,255,255,.025)}
 .preset-btn:hover{border-color:var(--accent);color:var(--text);background:var(--accent-dim)}
 .preset-btn .pe{font-size:14px}
 
-/* clickable monitoring card */
-.mc.clickable{cursor:pointer}
-.mc.clickable:hover{border-color:rgba(0,212,255,.4);box-shadow:var(--shadow);transform:translateY(-1px)}
-.mc.clickable:hover .mc-n{color:var(--accent)}
-
-/* connection modal table */
-.conn-table{width:100%;border-collapse:collapse;font-size:13px}
-.conn-table thead th{padding:8px 12px;text-align:left;font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.7px;color:var(--text-muted);background:rgba(0,0,0,.2);border-bottom:1px solid var(--border);white-space:nowrap}
-.conn-table tbody td{padding:10px 12px;border-bottom:1px solid rgba(48,54,61,.5);vertical-align:middle}
-.conn-table tbody tr:last-child td{border-bottom:none}
-.conn-table tbody tr:hover{background:rgba(255,255,255,.025)}
-.conn-ip{font-family:monospace;font-size:13px;font-weight:600}
-
 /* scrollbar */
 ::-webkit-scrollbar{width:5px;height:5px}
 ::-webkit-scrollbar-track{background:transparent}
@@ -432,7 +419,7 @@ tbody tr:hover{background:rgba(255,255,255,.025)}
         <div class="presets">
           <button class="preset-btn" onclick="applyPreset('Minecraft Java','tcp',25565,true)"  type="button"><span class="pe">⛏️</span>Minecraft Java</button>
           <button class="preset-btn" onclick="applyPreset('Minecraft Bedrock','udp',19132,false)" type="button"><span class="pe">📱</span>Minecraft Bedrock</button>
-          <button class="preset-btn" onclick="applyPreset('Satisfactory','udp',7777,false)"  type="button"><span class="pe">🏭</span>Satisfactory</button>
+          <button class="preset-btn" onclick="applyPreset('Satisfactory','both',7777,false)"  type="button"><span class="pe">🏭</span>Satisfactory</button>
           <button class="preset-btn" onclick="applyPreset('Valheim','udp',2456,false)"       type="button"><span class="pe">🪓</span>Valheim</button>
           <button class="preset-btn" onclick="applyPreset('ARK','udp',7777,false)"           type="button"><span class="pe">🦕</span>ARK</button>
           <button class="preset-btn" onclick="applyPreset('CS2','udp',27015,false)"          type="button"><span class="pe">🔫</span>CS2</button>
@@ -476,23 +463,6 @@ tbody tr:hover{background:rgba(255,255,255,.025)}
     <div class="mfoot">
       <button class="btn btn-g" onclick="closeModal()">Abbrechen</button>
       <button class="btn btn-p" onclick="save()">Speichern</button>
-    </div>
-  </div>
-</div>
-
-<!-- Connection Details Modal -->
-<div class="overlay" id="conn-overlay" onclick="if(event.target===this)closeConnections()">
-  <div class="mbox" style="width:700px">
-    <div class="mhead">
-      <h3 id="conn-title">Verbindungen</h3>
-      <button class="mcls" onclick="closeConnections()">✕</button>
-    </div>
-    <div class="mbody" id="conn-body" style="padding:0">
-      <div class="empty"><div class="ei">⏳</div><h3>Lade…</h3></div>
-    </div>
-    <div class="mfoot" style="justify-content:space-between">
-      <span id="conn-count" style="font-size:12px;color:var(--text-muted)"></span>
-      <button class="btn btn-g btn-sm" onclick="closeConnections()">Schließen</button>
     </div>
   </div>
 </div>
@@ -631,7 +601,7 @@ function renderDash(s){
   }
   document.getElementById('dash-live').innerHTML=
     `<div class="mgrid">${active.map(t=>`
-      <div class="mc live clickable" onclick="openConnections(${t.id},'${(t.name||t.subdomain).replace(/'/g,'&#39;')}')" title="Klicken für Verbindungsdetails">
+      <div class="mc live">
         <div class="mc-h"><span class="dot dot-on"></span><span class="mc-n">${t.name||t.subdomain}</span>${pb(t.protocol)}</div>
         <div class="mc-m">
           <div class="mm"><div class="v vd">${fmtS(t.bytes_out_per_sec)}</div><div class="l">Down/s</div></div>
@@ -817,7 +787,7 @@ function renderMon(s){
   const idle=T.filter(t=>t.online&&t.active_connections===0&&t.bytes_in_per_sec===0&&t.bytes_out_per_sec===0);
   const off=T.filter(t=>!t.online);
   const card=(t,full=true)=>`
-    <div class="mc ${full?'live':''} ${full?'clickable':''}" ${full?`onclick="openConnections(${t.id},'${(t.name||t.subdomain).replace(/'/g,"&#39;")}')" title="Klicken für Verbindungsdetails"`:''}>
+    <div class="mc ${full?'live':''}">
       <div class="mc-h">${dotEl(t.online,t.tunnel_status)}<span class="mc-n">${t.name||t.subdomain}</span>${pb(t.protocol)}</div>
       ${full?`<div class="mc-m">
         <div class="mm"><div class="v vd">${fmtS(t.bytes_out_per_sec)}</div><div class="l">Down/s</div></div>
@@ -921,75 +891,6 @@ async function save(){
   }
   toast(id?'Tunnel aktualisiert':'Tunnel erstellt');
   closeModal();loadTunnels();
-}
-
-// ── Connection details modal ──────────────────────────────────────────────────
-let connDbId = null, connTimer = null;
-
-function openConnections(dbId, name) {
-  connDbId = dbId;
-  document.getElementById('conn-title').textContent = '🔗 ' + (name || 'Tunnel') + ' · Verbindungen';
-  document.getElementById('conn-overlay').classList.add('open');
-  fetchConnections();
-  if (connTimer) clearInterval(connTimer);
-  connTimer = setInterval(fetchConnections, 2000);
-}
-
-function closeConnections() {
-  document.getElementById('conn-overlay').classList.remove('open');
-  connDbId = null;
-  if (connTimer) { clearInterval(connTimer); connTimer = null; }
-}
-
-async function fetchConnections() {
-  if (!connDbId) return;
-  try {
-    const res = await fetch(API + '/api/tunnels/' + connDbId + '/connections');
-    if (!res.ok) throw new Error('HTTP ' + res.status);
-    renderConnections(await res.json());
-  } catch(e) {
-    document.getElementById('conn-body').innerHTML =
-      '<div class="empty"><div class="ei">⚠️</div><h3>Fehler beim Laden</h3><p>' + e + '</p></div>';
-  }
-}
-
-function renderConnections(conns) {
-  const ct = document.getElementById('conn-count');
-  const body = document.getElementById('conn-body');
-  if (!conns || !conns.length) {
-    ct.textContent = 'Keine aktiven Verbindungen';
-    body.innerHTML = '<div class="empty" style="padding:40px 24px"><div class="ei">🔌</div>' +
-      '<h3>Keine Spieler verbunden</h3><p>Warte auf Verbindungen…</p></div>';
-    return;
-  }
-  ct.textContent = conns.length + ' Verbindung' + (conns.length !== 1 ? 'en' : '') + ' · Live';
-  let h = '<table class="conn-table"><thead><tr>' +
-    '<th>IP Adresse</th><th>Verbunden</th><th>↓ /s</th><th>↑ /s</th>' +
-    '<th>Total ↓</th><th>Total ↑</th><th></th>' +
-    '</tr></thead><tbody>';
-  for (const c of conns) {
-    h += '<tr>' +
-      `<td><span class="conn-ip">${c.peer_ip}</span></td>` +
-      `<td style="color:var(--text-muted);font-size:12px">${fmtUp(c.connected_secs)}</td>` +
-      `<td style="color:var(--accent);font-weight:600">${fmtS(c.bytes_out_per_sec)}</td>` +
-      `<td style="color:var(--green);font-weight:600">${fmtS(c.bytes_in_per_sec)}</td>` +
-      `<td style="color:var(--text-muted);font-size:12px">${fmtB(c.bytes_out)}</td>` +
-      `<td style="color:var(--text-muted);font-size:12px">${fmtB(c.bytes_in)}</td>` +
-      `<td><button class="btn btn-del btn-xs" title="Verbindung trennen"` +
-      ` onclick="disconnectConn(${connDbId},${c.stream_id},'${c.peer_ip}')">✕ Trennen</button></td>` +
-      '</tr>';
-  }
-  h += '</tbody></table>';
-  body.innerHTML = h;
-}
-
-async function disconnectConn(dbId, streamId, ip) {
-  if (!confirm('Verbindung von ' + ip + ' trennen?')) return;
-  try {
-    const r = await fetch(API + '/api/tunnels/' + dbId + '/connections/' + streamId, { method: 'DELETE' });
-    toast(r.ok ? ip + ' getrennt' : 'Fehler: ' + r.status, r.ok ? 'ok' : 'err');
-    fetchConnections();
-  } catch(e) { toast('Fehler: ' + e, 'err'); }
 }
 
 // init
