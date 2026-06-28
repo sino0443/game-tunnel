@@ -23,7 +23,7 @@ use stats::Stats;
 static TUNNEL_ID_COUNTER: AtomicU32 = AtomicU32::new(1);
 
 const HEARTBEAT_INTERVAL_SECS: u64 = 5;
-const SERVER_IDLE_TIMEOUT_SECS: u64 = 30;
+const SERVER_IDLE_TIMEOUT_SECS: u64 = 120;
 
 #[derive(Debug, Clone)]
 pub struct DbTunnel {

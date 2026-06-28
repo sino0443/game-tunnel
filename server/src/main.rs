@@ -23,7 +23,7 @@ use tracing::{debug, error, info, warn};
 static STREAM_ID_COUNTER: AtomicU64 = AtomicU64::new(1);
 static ACTIVE_CONNECTIONS: AtomicUsize = AtomicUsize::new(0);
 const MAX_CONNECTIONS: usize = 200;
-const CLIENT_IDLE_TIMEOUT_SECS: u64 = 30;
+const CLIENT_IDLE_TIMEOUT_SECS: u64 = 120;
 /// UDP sessions are cleaned up after this period of inactivity.
 /// 300 s (5 minutes) gives games with long loading phases (Satisfactory,
 /// ARK, Valheim) enough time to finish loading a map without the tunnel
@@ -461,17 +461,49 @@ async fn handle_control_message(
                     let mut buf = vec![0u8; 65535];
                     let mut peer_streams: HashMap<std::net::SocketAddr, u64> = HashMap::new();
                     let mut last_seen: HashMap<std::net::SocketAddr, std::time::Instant> = HashMap::new();
-                    let mut cleanup_interval = tokio::time::interval(tokio::time::Duration::from_secs(10));
+                    let mut cleanup_interval  = tokio::time::interval(tokio::time::Duration::from_secs(10));
+                    // Keep-alive: sends a minimal UDP packet back to the player every 5 s so
+                    // aggressive NAT/CGNAT entries don't expire between game packets.
+                    let mut keepalive_interval = tokio::time::interval(tokio::time::Duration::from_secs(5));
                     loop { tokio::select! {
                         res = socket.recv_from(&mut buf) => { match res {
                             Ok((len, peer_addr)) => {
                                 last_seen.insert(peer_addr, std::time::Instant::now());
-                                let stream_id = if let Some(&sid) = peer_streams.get(&peer_addr) { sid } else {
-                                    let sid = STREAM_ID_COUNTER.fetch_add(1, Ordering::Relaxed);
-                                    peer_streams.insert(peer_addr, sid);
-                                    { let mut st = state_udp.write().await; st.udp_peers.insert(sid, UdpPeer { addr: peer_addr, socket: Arc::clone(&socket) }); st.stream_tunnel.insert(sid, tunnel_id); }
-                                    let _ = write_tx_udp.send(Frame::Control(Message::NewConnection { tunnel_id, stream_id: sid, is_udp: true })).await;
+                                let stream_id = if let Some(&sid) = peer_streams.get(&peer_addr) {
                                     sid
+                                } else {
+                                    // NAT-rebinding detection: same IP, different port.
+                                    // Some routers/CGNAT reassign the UDP source port within
+                                    // seconds.  Instead of creating a new session (which would
+                                    // break the in-progress game connection), we update the
+                                    // existing session to use the new address.
+                                    let rebind = peer_streams.iter()
+                                        .find(|(a, _)| a.ip() == peer_addr.ip())
+                                        .map(|(a, &sid)| (*a, sid));
+
+                                    if let Some((old_addr, existing_sid)) = rebind {
+                                        info!("UDP NAT rebind detected: {} → {} (stream {})",
+                                              old_addr, peer_addr, existing_sid);
+                                        peer_streams.remove(&old_addr);
+                                        last_seen.remove(&old_addr);
+                                        peer_streams.insert(peer_addr, existing_sid);
+                                        last_seen.insert(peer_addr, std::time::Instant::now());
+                                        // Update the stored peer address so responses go to new port.
+                                        {
+                                            let mut st = state_udp.write().await;
+                                            st.udp_peers.insert(existing_sid, UdpPeer {
+                                                addr: peer_addr, socket: Arc::clone(&socket),
+                                            });
+                                        }
+                                        existing_sid
+                                    } else {
+                                        // Genuinely new player connection.
+                                        let sid = STREAM_ID_COUNTER.fetch_add(1, Ordering::Relaxed);
+                                        peer_streams.insert(peer_addr, sid);
+                                        { let mut st = state_udp.write().await; st.udp_peers.insert(sid, UdpPeer { addr: peer_addr, socket: Arc::clone(&socket) }); st.stream_tunnel.insert(sid, tunnel_id); }
+                                        let _ = write_tx_udp.send(Frame::Control(Message::NewConnection { tunnel_id, stream_id: sid, is_udp: true })).await;
+                                        sid
+                                    }
                                 };
                                 let _ = write_tx_udp.send(Frame::Data { stream_id, payload: buf[..len].to_vec() }).await;
                             }
@@ -495,6 +527,15 @@ async fn handle_control_message(
                                 }
                             }
                         }
+                        _ = keepalive_interval.tick() => {
+                            // Send a 1-byte keepalive to every active peer so their NAT
+                            // entries stay alive between real game packets.  UE5 and most
+                            // game engines silently discard packets that don't match the
+                            // expected frame format, so this is harmless.
+                            for (addr, _) in &peer_streams {
+                                let _ = socket.send_to(&[0u8], *addr).await;
+                            }
+                        }
                         _ = shutdown.changed() => { info!("Shutting down port {} (UDP)", remote_port); break; }
                     }}
                 });
@@ -511,7 +552,7 @@ async fn handle_control_message(
             for sid in &sids { st.streams.remove(sid); st.udp_peers.remove(sid); st.stream_tunnel.remove(sid); let _ = write_tx.send(Frame::StreamClose { stream_id: *sid }).await; }
             if !sids.is_empty() { info!("Closed {} connections for tunnel {}", sids.len(), tunnel_id); }
         }
-        Message::Ping => { let _ = write_tx.send(Frame::Control(Message::Pong)).await; }
+        Message::Ping => { let _ = write_tx.try_send(Frame::Control(Message::Pong)); }
         _ => { warn!("Unexpected control message from {}: {:?}", client_addr, msg); }
     }
     Ok(())
