@@ -951,7 +951,12 @@ async fn handle_local_udp_stream(
                     { let t = stats_r.tunnels.read().await; if let Some(ts) = t.get(&tunnel_id) { ts.bytes_out.fetch_add(n as u64, Ordering::Relaxed); } }
                     let svrs = servers_r.read().await;
                     if let Some(srv) = svrs.get(&server_id) {
-                        if srv.write_tx.send(Frame::Data { stream_id, payload: buf[..n].to_vec() }).await.is_err() { break; }
+                        // Non-blocking send: drop this UDP packet if the channel is full
+                        // rather than queueing it.  Real-time game UDP is better dropped
+                        // than delayed — UE5 handles packet loss via its own reliability
+                        // layer.  Queueing causes burst delivery that triggers UE5's
+                        // "missed acks" timeout (e.g. on Satisfactory's startup burst).
+                        let _ = srv.write_tx.try_send(Frame::Data { stream_id, payload: buf[..n].to_vec() });
                     } else { break; }
                 }
                 Err(e) => {
