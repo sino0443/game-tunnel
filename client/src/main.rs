@@ -656,6 +656,7 @@ async fn sync_tunnels_from_db(
                         "both" => TunnelProtocol::Both,
                         _ => TunnelProtocol::Tcp,
                     },
+                    db_id: dbt.id,
                 })).await;
             } else {
                 continue;
@@ -712,6 +713,7 @@ async fn sync_tunnels_from_db(
                         "both" => TunnelProtocol::Both,
                         _ => TunnelProtocol::Tcp,
                     },
+                    db_id: dbt.id,
                 })).await.is_err() { continue; }
             } else { continue; }
         }
