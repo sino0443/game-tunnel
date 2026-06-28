@@ -394,7 +394,7 @@ async fn get_stats(State(state): State<Arc<AppState>>) -> impl IntoResponse {
         total_bytes_in:           ms.clients.iter().map(|c| c.total_bytes_in).sum(),
         total_bytes_out:          ms.clients.iter().map(|c| c.total_bytes_out).sum(),
         total_bytes_in_per_sec:   ms.clients.iter().map(|c| c.bytes_in_per_sec).sum(),
-        total_bytes_out_per_sec:  ms.clients.iter().map(|c| c.total_bytes_out).sum(),
+        total_bytes_out_per_sec:  ms.clients.iter().map(|c| c.bytes_out_per_sec).sum(),
         clients: ms.clients.clone(),
         tunnels: ms.tunnels.clone(),
     })
