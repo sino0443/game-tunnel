@@ -396,7 +396,7 @@ async fn handle_control_message(
     state: &Arc<RwLock<ServerState>>, write_tx: &mpsc::Sender<Frame>,
 ) -> Result<()> {
     match msg {
-        Message::OpenTunnel { tunnel_id, remote_port, protocol } => {
+        Message::OpenTunnel { tunnel_id, remote_port, protocol, db_id: _ } => {
             if !is_valid_game_port(remote_port) {
                 warn!("Invalid port {} from {}", remote_port, client_addr);
                 let _ = write_tx.send(Frame::Control(Message::CloseTunnel { tunnel_id })).await;
