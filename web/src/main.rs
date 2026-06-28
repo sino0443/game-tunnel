@@ -217,14 +217,13 @@ async fn create_tunnel(State(state): State<Arc<AppState>>, Json(req): Json<Creat
     };
 
     // Read all existing IDs into a HashSet, then find the lowest free one in Rust.
-    // Use i64 for the query scalar so sqlx can decode any MySQL integer column
-    // (INT, INT UNSIGNED, BIGINT, …) without a type-mismatch error.
-    // When tunnels.id is INT (signed), using u32 here fails on any non-empty
-    // table because sqlx cannot widen a signed type into u32.
-let taken: HashSet<u32> = match sqlx::query_scalar::<_, i64>("SELECT id FROM tunnels")
+    // CAST(id AS UNSIGNED) forces MySQL to return BIGINT UNSIGNED regardless of
+    // whether tunnels.id is INT, INT UNSIGNED, or BIGINT — sqlx maps that cleanly
+    // to u64 without type-mismatch errors.
+    let taken: HashSet<u32> = match sqlx::query_scalar::<_, u64>("SELECT CAST(id AS UNSIGNED) FROM tunnels")
         .fetch_all(&mut *tx).await
     {
-        Ok(ids) => ids.into_iter().filter_map(|n| if n > 0 { Some(n as u32) } else { None }).collect(),
+        Ok(ids) => ids.into_iter().filter_map(|n| if n > 0 && n <= u32::MAX as u64 { Some(n as u32) } else { None }).collect(),
         Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, format!("{}", e)).into_response(),
     };
     // (1u32..) is infinite so unwrap_or is unreachable, but keeps the type checker happy.
