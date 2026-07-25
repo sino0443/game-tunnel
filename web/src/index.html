@@ -265,14 +265,18 @@ tbody tr:hover{background:rgba(255,255,255,.025)}
 .preset-btn:hover{border-color:var(--accent);color:var(--text);background:var(--accent-dim)}
 .preset-btn .pe{font-size:14px}
 
-/* players modal */
-.pbox{background:var(--bg-card);border:1px solid var(--border);border-radius:var(--radius);width:700px;max-width:96vw;max-height:90vh;overflow-y:auto;box-shadow:var(--shadow)}
-.ptable{width:100%;border-collapse:collapse;font-size:12px}
-.ptable th{padding:8px 14px;text-align:left;font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.7px;color:var(--text-muted);background:rgba(0,0,0,.2);border-bottom:1px solid var(--border);white-space:nowrap}
-.ptable td{padding:9px 14px;border-bottom:1px solid rgba(48,54,61,.4);vertical-align:middle}
-.ptable tr:last-child td{border-bottom:none}
-.ptable tr:hover{background:rgba(255,255,255,.025)}
-.ptable td:first-child{font-family:monospace;color:var(--text-muted)}
+/* clickable monitoring card */
+.mc.clickable{cursor:pointer}
+.mc.clickable:hover{border-color:rgba(0,212,255,.4);box-shadow:var(--shadow);transform:translateY(-1px)}
+.mc.clickable:hover .mc-n{color:var(--accent)}
+
+/* connection modal table */
+.conn-table{width:100%;border-collapse:collapse;font-size:13px}
+.conn-table thead th{padding:8px 12px;text-align:left;font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.7px;color:var(--text-muted);background:rgba(0,0,0,.2);border-bottom:1px solid var(--border);white-space:nowrap}
+.conn-table tbody td{padding:10px 12px;border-bottom:1px solid rgba(48,54,61,.5);vertical-align:middle}
+.conn-table tbody tr:last-child td{border-bottom:none}
+.conn-table tbody tr:hover{background:rgba(255,255,255,.025)}
+.conn-ip{font-family:monospace;font-size:13px;font-weight:600}
 
 /* scrollbar */
 ::-webkit-scrollbar{width:5px;height:5px}
@@ -476,18 +480,19 @@ tbody tr:hover{background:rgba(255,255,255,.025)}
   </div>
 </div>
 
-<!-- Players overlay -->
-<div class="overlay" id="players-overlay" onclick="if(event.target===this)closePlayers()">
-  <div class="pbox">
+<!-- Connection Details Modal -->
+<div class="overlay" id="conn-overlay" onclick="if(event.target===this)closeConnections()">
+  <div class="mbox" style="width:700px">
     <div class="mhead">
-      <h3 id="players-title">Spieler</h3>
-      <div style="display:flex;gap:8px;align-items:center">
-        <button class="btn btn-del btn-xs" onclick="kickAll()">Alle trennen</button>
-        <button class="mcls" onclick="closePlayers()">✕</button>
-      </div>
+      <h3 id="conn-title">Verbindungen</h3>
+      <button class="mcls" onclick="closeConnections()">✕</button>
     </div>
-    <div class="mbody" id="players-body">
-      <div class="empty"><div class="ei">👥</div><h3>Lade Spieler…</h3></div>
+    <div class="mbody" id="conn-body" style="padding:0">
+      <div class="empty"><div class="ei">⏳</div><h3>Lade…</h3></div>
+    </div>
+    <div class="mfoot" style="justify-content:space-between">
+      <span id="conn-count" style="font-size:12px;color:var(--text-muted)"></span>
+      <button class="btn btn-g btn-sm" onclick="closeConnections()">Schließen</button>
     </div>
   </div>
 </div>
@@ -626,7 +631,7 @@ function renderDash(s){
   }
   document.getElementById('dash-live').innerHTML=
     `<div class="mgrid">${active.map(t=>`
-      <div class="mc live">
+      <div class="mc live clickable" onclick="openConnections(${t.id},'${(t.name||t.subdomain).replace(/'/g,'&#39;')}')" title="Klicken für Verbindungsdetails">
         <div class="mc-h"><span class="dot dot-on"></span><span class="mc-n">${t.name||t.subdomain}</span>${pb(t.protocol)}</div>
         <div class="mc-m">
           <div class="mm"><div class="v vd">${fmtS(t.bytes_out_per_sec)}</div><div class="l">Down/s</div></div>
@@ -667,8 +672,7 @@ function renderTunnels(tunnels){
         <td style="font-size:12px;color:var(--text-muted)">${cName(t.client_id)}</td>
         <td>${sb}</td>
         <td><span class="badge b-muted" style="font-size:10px">${t.tunnel_status||'—'}</span></td>
-        <td style="display:flex;gap:4px;padding:12px 16px;flex-wrap:wrap">
-          ${t.active_connections>0?`<button class="btn btn-p btn-xs" onclick="showPlayers(${t.id},${JSON.stringify(t.name||t.subdomain)})">👥 ${t.active_connections}</button>`:''}
+        <td style="display:flex;gap:4px;padding:12px 16px">
           ${t.online?`<button class="btn btn-warn btn-xs" onclick="stopT(${t.id})">⏹ Stop</button>`
                     :`<button class="btn btn-ok btn-xs" onclick="startT(${t.id})">▶ Start</button>`}
           <button class="btn btn-g btn-xs" onclick="editT(${t.id})">✏ Edit</button>
@@ -813,7 +817,7 @@ function renderMon(s){
   const idle=T.filter(t=>t.online&&t.active_connections===0&&t.bytes_in_per_sec===0&&t.bytes_out_per_sec===0);
   const off=T.filter(t=>!t.online);
   const card=(t,full=true)=>`
-    <div class="mc ${full?'live':''}">
+    <div class="mc ${full?'live':''} ${full?'clickable':''}" ${full?`onclick="openConnections(${t.id},'${(t.name||t.subdomain).replace(/'/g,"&#39;")}')" title="Klicken für Verbindungsdetails"`:''}>
       <div class="mc-h">${dotEl(t.online,t.tunnel_status)}<span class="mc-n">${t.name||t.subdomain}</span>${pb(t.protocol)}</div>
       ${full?`<div class="mc-m">
         <div class="mm"><div class="v vd">${fmtS(t.bytes_out_per_sec)}</div><div class="l">Down/s</div></div>
@@ -919,63 +923,73 @@ async function save(){
   closeModal();loadTunnels();
 }
 
-// ── Players modal ────────────────────────────────────────────────────────────
-let playersTunnelId=null;
+// ── Connection details modal ──────────────────────────────────────────────────
+let connDbId = null, connTimer = null;
 
-async function showPlayers(id,name){
-  playersTunnelId=id;
-  document.getElementById('players-title').textContent=(name||'Tunnel')+' — Spieler';
-  document.getElementById('players-overlay').classList.add('open');
-  await refreshPlayers();
+function openConnections(dbId, name) {
+  connDbId = dbId;
+  document.getElementById('conn-title').textContent = '🔗 ' + (name || 'Tunnel') + ' · Verbindungen';
+  document.getElementById('conn-overlay').classList.add('open');
+  fetchConnections();
+  if (connTimer) clearInterval(connTimer);
+  connTimer = setInterval(fetchConnections, 2000);
 }
-function closePlayers(){
-  document.getElementById('players-overlay').classList.remove('open');
-  playersTunnelId=null;
+
+function closeConnections() {
+  document.getElementById('conn-overlay').classList.remove('open');
+  connDbId = null;
+  if (connTimer) { clearInterval(connTimer); connTimer = null; }
 }
-async function refreshPlayers(){
-  if(!playersTunnelId)return;
-  let conns;
-  try{conns=await(await fetch(API+'/api/tunnels/'+playersTunnelId+'/connections')).json();}
-  catch(e){document.getElementById('players-body').innerHTML='<div class="empty"><div class="ei">⚠️</div><h3>Fehler beim Laden</h3></div>';return;}
-  if(!Array.isArray(conns)||!conns.length){
-    document.getElementById('players-body').innerHTML='<div class="empty"><div class="ei">🏜️</div><h3>Keine aktiven Spieler</h3><p>Warte auf Verbindungen…</p></div>';
+
+async function fetchConnections() {
+  if (!connDbId) return;
+  try {
+    const res = await fetch(API + '/api/tunnels/' + connDbId + '/connections');
+    if (!res.ok) throw new Error('HTTP ' + res.status);
+    renderConnections(await res.json());
+  } catch(e) {
+    document.getElementById('conn-body').innerHTML =
+      '<div class="empty"><div class="ei">⚠️</div><h3>Fehler beim Laden</h3><p>' + e + '</p></div>';
+  }
+}
+
+function renderConnections(conns) {
+  const ct = document.getElementById('conn-count');
+  const body = document.getElementById('conn-body');
+  if (!conns || !conns.length) {
+    ct.textContent = 'Keine aktiven Verbindungen';
+    body.innerHTML = '<div class="empty" style="padding:40px 24px"><div class="ei">🔌</div>' +
+      '<h3>Keine Spieler verbunden</h3><p>Warte auf Verbindungen…</p></div>';
     return;
   }
-  document.getElementById('players-body').innerHTML=`
-    <table class="ptable">
-      <thead><tr><th>IP</th><th>Down ↓</th><th>Up ↑</th><th>↓/s</th><th>↑/s</th><th>Verbunden</th><th></th></tr></thead>
-      <tbody>${conns.map(c=>`
-        <tr>
-          <td>${c.peer_ip}</td>
-          <td>${fmtB(c.bytes_out)}</td>
-          <td>${fmtB(c.bytes_in)}</td>
-          <td style="color:var(--accent)">${fmtS(c.bytes_out_per_sec||0)}</td>
-          <td style="color:var(--green)">${fmtS(c.bytes_in_per_sec||0)}</td>
-          <td style="color:var(--text-muted)">${fmtUp(c.connected_secs||0)}</td>
-          <td><button class="btn btn-del btn-xs" onclick="kickPlayer(${c.stream_id})">Trennen</button></td>
-        </tr>`).join('')}
-      </tbody>
-    </table>`;
+  ct.textContent = conns.length + ' Verbindung' + (conns.length !== 1 ? 'en' : '') + ' · Live';
+  let h = '<table class="conn-table"><thead><tr>' +
+    '<th>IP Adresse</th><th>Verbunden</th><th>↓ /s</th><th>↑ /s</th>' +
+    '<th>Total ↓</th><th>Total ↑</th><th></th>' +
+    '</tr></thead><tbody>';
+  for (const c of conns) {
+    h += '<tr>' +
+      `<td><span class="conn-ip">${c.peer_ip}</span></td>` +
+      `<td style="color:var(--text-muted);font-size:12px">${fmtUp(c.connected_secs)}</td>` +
+      `<td style="color:var(--accent);font-weight:600">${fmtS(c.bytes_out_per_sec)}</td>` +
+      `<td style="color:var(--green);font-weight:600">${fmtS(c.bytes_in_per_sec)}</td>` +
+      `<td style="color:var(--text-muted);font-size:12px">${fmtB(c.bytes_out)}</td>` +
+      `<td style="color:var(--text-muted);font-size:12px">${fmtB(c.bytes_in)}</td>` +
+      `<td><button class="btn btn-del btn-xs" title="Verbindung trennen"` +
+      ` onclick="disconnectConn(${connDbId},${c.stream_id},'${c.peer_ip}')">✕ Trennen</button></td>` +
+      '</tr>';
+  }
+  h += '</tbody></table>';
+  body.innerHTML = h;
 }
-async function kickPlayer(streamId){
-  if(!playersTunnelId)return;
-  await fetch(API+'/api/tunnels/'+playersTunnelId+'/connections/'+streamId,{method:'DELETE'});
-  toast('Spieler getrennt','err');
-  await refreshPlayers();
+
+async function disconnectConn(dbId, streamId, ip) {
+  try {
+    const r = await fetch(API + '/api/tunnels/' + dbId + '/connections/' + streamId, { method: 'DELETE' });
+    toast(r.ok ? ip + ' getrennt' : 'Fehler: ' + r.status, r.ok ? 'ok' : 'err');
+    fetchConnections();
+  } catch(e) { toast('Fehler: ' + e, 'err'); }
 }
-async function kickAll(){
-  if(!playersTunnelId)return;
-  let conns;
-  try{conns=await(await fetch(API+'/api/tunnels/'+playersTunnelId+'/connections')).json();}
-  catch(_){return;}
-  if(!Array.isArray(conns)||!conns.length){toast('Keine aktiven Spieler');return;}
-  if(!confirm('Alle '+conns.length+' Spieler trennen?'))return;
-  await Promise.all(conns.map(c=>fetch(API+'/api/tunnels/'+playersTunnelId+'/connections/'+c.stream_id,{method:'DELETE'})));
-  toast(conns.length+' Spieler getrennt','err');
-  await refreshPlayers();
-}
-// Auto-refresh players list every 3 s while overlay is open.
-setInterval(()=>{if(playersTunnelId)refreshPlayers();},3000);
 
 // init
 loadDomains();loadServers();loadCD();loadTunnels();loadStats();
