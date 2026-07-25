@@ -15,7 +15,6 @@ use tokio_rustls::rustls;
 use tokio_rustls::TlsConnector;
 use tracing::{error, info, warn};
 
-mod database;
 mod stats;
 
 use stats::Stats;
@@ -444,10 +443,6 @@ async fn run_server_task(
 }
 
 async fn run_client(config: ClientConfig) -> Result<()> {
-    let db_pool = database::connect(&config.database).await?;
-    info!("Connected to MySQL as client '{}'", config.client_id);
-    database::ensure_columns(&db_pool).await?;
-
     let stats = Stats::new();
 
     for entry in &config.servers {
@@ -579,60 +574,80 @@ async fn run_client(config: ClientConfig) -> Result<()> {
         }
     });
 
-    // Polling loop: writes tunnel status to DB and syncs tunnel state from
-    // the manager API.
-    let db_poll_state      = Arc::clone(&state);
-    let db_poll_servers    = Arc::clone(&servers);
-    let db_poll_pool       = db_pool.clone();
-    let db_poll_http       = http_client.clone();
-    let db_poll_manager    = config.manager_url.clone();
-    let server_entries     = config.servers.clone();
-    let poll_interval      = config.database.poll_interval_secs;
-    let stats_for_db       = stats.clone();
-    let client_id          = config.client_id.clone();
+    // Polling loop: reports tunnel status to the manager and syncs the
+    // active tunnel set — no direct database access.
+    let poll_state    = Arc::clone(&state);
+    let poll_servers  = Arc::clone(&servers);
+    let poll_http     = http_client.clone();
+    let poll_manager  = config.manager_url.clone();
+    let server_entries = config.servers.clone();
+    let poll_interval = config.poll_interval_secs;
+    let poll_stats    = stats.clone();
+    let client_id     = config.client_id.clone();
 
     let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(poll_interval));
     loop {
         interval.tick().await;
-        if let Err(e) = write_status_to_db(
-            &db_poll_pool, &db_poll_state, &stats_for_db, &client_id,
+        if let Err(e) = report_status_to_manager(
+            &poll_http, &poll_manager, &client_id, &poll_state, &poll_stats,
         ).await {
-            error!("Status write error: {:?}", e);
+            error!("Status report error: {:?}", e);
         }
         if let Err(e) = sync_tunnels(
-            &db_poll_pool, &db_poll_http, &db_poll_manager,
-            &db_poll_state, &db_poll_servers,
-            &server_entries, &stats_for_db, &client_id,
+            &poll_http, &poll_manager,
+            &poll_state, &poll_servers,
+            &server_entries, &poll_stats, &client_id,
         ).await {
             error!("Tunnel sync error: {:?}", e);
         }
     }
 }
 
-async fn write_status_to_db(
-    pool: &sqlx::MySqlPool,
+/// One entry in the batch status report sent to the manager.
+#[derive(serde::Serialize)]
+struct TunnelStatusUpdate {
+    db_id: u32,
+    status: String,
+}
+
+/// Reports the current status of all active tunnels to the manager via
+/// `POST /api/client/{client_id}/tunnel-status`.
+/// The manager writes tunnel_status and last_seen to the database.
+async fn report_status_to_manager(
+    http_client: &reqwest::Client,
+    manager_url: &str,
+    client_id: &str,
     state: &Arc<RwLock<ClientState>>,
     stats: &Stats,
-    client_id: &str,
 ) -> Result<()> {
-    let tunnels_snap = stats.tunnels.read().await;
-    let st = state.read().await;
-    for (tunnel_id, ts) in tunnels_snap.iter() {
-        let db_id = st.tunnels.iter()
-            .find(|(_, t)| t.tunnel_id == *tunnel_id)
-            .map(|(k, _)| *k);
-        let Some(db_id) = db_id else { continue; };
-        let active = ts.active_connections.load(Ordering::Relaxed);
-        let status = if active > 0 { "running" } else { "idle" };
-        let _ = database::write_tunnel_status(pool, db_id, status, client_id).await;
+    let mut updates: Vec<TunnelStatusUpdate> = Vec::new();
+    {
+        let tunnels_snap = stats.tunnels.read().await;
+        let st = state.read().await;
+        for (tunnel_id, ts) in tunnels_snap.iter() {
+            let db_id = st.tunnels.iter()
+                .find(|(_, t)| t.tunnel_id == *tunnel_id)
+                .map(|(k, _)| *k);
+            let Some(db_id) = db_id else { continue; };
+            let active = ts.active_connections.load(Ordering::Relaxed);
+            let status = if active > 0 { "running" } else { "idle" };
+            updates.push(TunnelStatusUpdate { db_id, status: status.to_string() });
+        }
+    }
+    if updates.is_empty() { return Ok(()); }
+    let url = format!(
+        "{}/api/client/{}/tunnel-status",
+        manager_url.trim_end_matches('/'),
+        client_id
+    );
+    if let Err(e) = http_client.post(&url).json(&updates).send().await {
+        warn!("Status report to manager failed: {:?}", e);
     }
     Ok(())
 }
 
 /// Syncs the client's active tunnel set against the manager API.
-/// Replaces the former `sync_tunnels_from_db` which read directly from MySQL.
 async fn sync_tunnels(
-    pool: &sqlx::MySqlPool,
     http_client: &reqwest::Client,
     manager_url: &str,
     state: &Arc<RwLock<ClientState>>,
@@ -690,8 +705,17 @@ async fn sync_tunnels(
                 st.tunnel_server.remove(&t.tunnel_id);
             }
             stats.remove_tunnel(tunnel_id).await;
-            let _ = sqlx::query("UPDATE tunnels SET tunnel_status = 'stopped' WHERE id = ?")
-                .bind(db_id).execute(pool).await;
+            // Report "stopped" to manager so it updates the DB.
+            let url = format!(
+                "{}/api/client/{}/tunnel-status",
+                manager_url.trim_end_matches('/'),
+                client_id
+            );
+            let _ = http_client
+                .post(&url)
+                .json(&[TunnelStatusUpdate { db_id: *db_id, status: "stopped".to_string() }])
+                .send()
+                .await;
         }
     }
 

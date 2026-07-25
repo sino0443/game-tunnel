@@ -168,6 +168,7 @@ async fn main() -> Result<()> {
         .route("/api/client/{uuid}/server",  get(get_server_for_client))
         .route("/api/client/{uuid}/servers", get(get_servers_for_client))
         .route("/api/client/{client_id}/tunnels", get(list_client_tunnels))
+        .route("/api/client/{client_id}/tunnel-status", post(update_client_tunnel_status))
         .layer(CorsLayer::permissive())
         .with_state(state);
 
@@ -807,4 +808,34 @@ async fn list_client_tunnels(
             (StatusCode::INTERNAL_SERVER_ERROR, format!("{}", e)).into_response()
         }
     }
+}
+
+// ── Client tunnel-status endpoint ────────────────────────────────────────────
+
+/// One status entry sent by the client in a batch update.
+#[derive(Deserialize)]
+struct TunnelStatusUpdate {
+    db_id: u32,
+    status: String,
+}
+
+/// `POST /api/client/{client_id}/tunnel-status`
+///
+/// The client calls this endpoint (instead of writing to MySQL directly) to
+/// report the current status ("running", "idle", "stopped") of its tunnels.
+/// Accepts a JSON array so the client can batch-update all tunnels in one call.
+async fn update_client_tunnel_status(
+    Path(client_id): Path<String>,
+    State(state): State<Arc<AppState>>,
+    Json(updates): Json<Vec<TunnelStatusUpdate>>,
+) -> impl IntoResponse {
+    for u in &updates {
+        if let Err(e) = database::update_tunnel_status(&state.db, u.db_id, &u.status, &client_id).await {
+            warn!(
+                "Status update failed for tunnel {} (client '{}'): {:?}",
+                u.db_id, client_id, e
+            );
+        }
+    }
+    StatusCode::NO_CONTENT
 }

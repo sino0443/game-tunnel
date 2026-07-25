@@ -296,6 +296,25 @@ pub async fn upsert_client_server_mapping(
     Ok(res.rows_affected() >= 1)
 }
 
+/// Updates tunnel_status and last_seen for a tunnel owned by `client_id`.
+/// Called by the client via the manager API instead of writing to the DB directly.
+pub async fn update_tunnel_status(
+    pool: &MySqlPool,
+    db_id: u32,
+    status: &str,
+    client_id: &str,
+) -> Result<()> {
+    sqlx::query(
+        "UPDATE tunnels SET tunnel_status = ?, last_seen = NOW() WHERE id = ? AND client_id = ?",
+    )
+    .bind(status)
+    .bind(db_id)
+    .bind(client_id)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
 /// Full tunnel data returned to a client via the manager API.
 /// Contains all fields the client needs to open and manage its tunnels.
 pub struct ClientTunnelRow {

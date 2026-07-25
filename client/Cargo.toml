@@ -13,10 +13,7 @@ toml = { workspace = true }
 anyhow = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
-sqlx = { workspace = true }
 reqwest = { workspace = true }
-chrono = { workspace = true }
-uuid = { workspace = true }
 tokio-rustls = { workspace = true }
 rustls-pemfile = { workspace = true }
 socket2 = { version = "0.5", features = ["all"] }
