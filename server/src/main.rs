@@ -1,11 +1,10 @@
 use anyhow::{Context, Result};
-use axum::extract::{Path, State};
-use axum::http::StatusCode;
-use axum::routing::{delete, get, post};
+use axum::extract::State;
+use axum::routing::post;
 use axum::{Json, Router};
 use game_tunnel_shared::config::ServerConfig;
 use game_tunnel_shared::protocol::{self, Frame, Message, TunnelProtocol};
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::BufReader;
@@ -44,33 +43,6 @@ const PRE_AUTH_TTL_SECS: u64 = 10;
 /// manager granted the pre-authorization.
 type PreAuthCache = Arc<RwLock<HashMap<String, Instant>>>;
 
-/// Per-connection stats and shutdown handle, stored in the global registry.
-struct ConnEntry {
-    db_id: u32,
-    tunnel_id: u32,
-    peer_ip: String,
-    connected_at: Instant,
-    bytes_in:  Arc<AtomicU64>,
-    bytes_out: Arc<AtomicU64>,
-    /// Computed once per second by the rate-update task.
-    bytes_in_per_sec:  Arc<AtomicU64>,
-    bytes_out_per_sec: Arc<AtomicU64>,
-    /// Previous sample used to compute rates.
-    prev_bytes_in:  Arc<AtomicU64>,
-    prev_bytes_out: Arc<AtomicU64>,
-    /// Sending `true` causes the player stream handler to disconnect.
-    shutdown_tx: watch::Sender<bool>,
-}
-
-/// Global registry of all active player connections, keyed by stream_id.
-type ConnRegistry = Arc<RwLock<HashMap<u64, ConnEntry>>>;
-
-/// Combined state for the management HTTP server.
-struct MgmtState {
-    pre_auth:    PreAuthCache,
-    connections: ConnRegistry,
-}
-
 struct ActiveTunnel {
     #[allow(dead_code)] tunnel_id: u32,
     #[allow(dead_code)] remote_port: u16,
@@ -83,8 +55,6 @@ struct UdpPeer { addr: std::net::SocketAddr, socket: Arc<UdpSocket> }
 
 struct ServerState {
     tunnels: HashMap<u32, ActiveTunnel>,
-    /// Maps tunnel_id → db_id so new connections can be tagged with the DB id.
-    tunnel_db_ids: HashMap<u32, u32>,
     streams: HashMap<u64, PlayerStream>,
     udp_peers: HashMap<u64, UdpPeer>,
     stream_tunnel: HashMap<u64, u32>,
@@ -142,70 +112,21 @@ struct PreAuthRequest {
 /// Called by the manager to notify the server that a client with the given
 /// UUID is expected to connect within the next `PRE_AUTH_TTL_SECS` seconds.
 async fn handle_pre_auth_request(
-    State(state): State<Arc<MgmtState>>,
+    State(cache): State<PreAuthCache>,
     Json(req): Json<PreAuthRequest>,
 ) -> axum::http::StatusCode {
-    let mut c = state.pre_auth.write().await;
+    let mut c = cache.write().await;
     c.insert(req.client_uuid.clone(), Instant::now());
     info!("Pre-auth stored for client UUID {} (TTL: {}s)", req.client_uuid, PRE_AUTH_TTL_SECS);
     axum::http::StatusCode::OK
 }
 
-/// Response shape for `GET /api/connections`.
-#[derive(Serialize)]
-struct ConnInfo {
-    stream_id: u64,
-    db_id: u32,
-    tunnel_id: u32,
-    peer_ip: String,
-    bytes_in: u64,
-    bytes_out: u64,
-    bytes_in_per_sec: u64,
-    bytes_out_per_sec: u64,
-    connected_secs: u64,
-}
-
-/// `GET /api/connections` — returns all active player connections.
-async fn list_connections(
-    State(state): State<Arc<MgmtState>>,
-) -> impl axum::response::IntoResponse {
-    let reg = state.connections.read().await;
-    let list: Vec<ConnInfo> = reg.iter().map(|(&sid, e)| ConnInfo {
-        stream_id:         sid,
-        db_id:             e.db_id,
-        tunnel_id:         e.tunnel_id,
-        peer_ip:           e.peer_ip.clone(),
-        bytes_in:          e.bytes_in.load(Ordering::Relaxed),
-        bytes_out:         e.bytes_out.load(Ordering::Relaxed),
-        bytes_in_per_sec:  e.bytes_in_per_sec.load(Ordering::Relaxed),
-        bytes_out_per_sec: e.bytes_out_per_sec.load(Ordering::Relaxed),
-        connected_secs:    e.connected_at.elapsed().as_secs(),
-    }).collect();
-    Json(list)
-}
-
-/// `DELETE /api/connections/{stream_id}` — force-disconnects a player.
-async fn disconnect_connection(
-    State(state): State<Arc<MgmtState>>,
-    Path(stream_id): Path<u64>,
-) -> impl axum::response::IntoResponse {
-    let mut reg = state.connections.write().await;
-    if let Some(entry) = reg.remove(&stream_id) {
-        let _ = entry.shutdown_tx.send(true);
-        info!("Force-disconnected stream {} ({})", stream_id, entry.peer_ip);
-        (StatusCode::OK, Json(serde_json::json!({"message": "Disconnected"}))).into_response()
-    } else {
-        (StatusCode::NOT_FOUND, Json(serde_json::json!({"error": "connection not found"}))).into_response()
-    }
-}
-
-/// Starts the management HTTP server (pre-auth + connection management).
-async fn start_mgmt_server(bind_addr: String, state: Arc<MgmtState>) {
+/// Starts the management HTTP server that listens for pre-auth notifications
+/// from the manager. This runs in a background task.
+async fn start_mgmt_server(bind_addr: String, cache: PreAuthCache) {
     let app = Router::new()
-        .route("/api/manager/pre-auth",        post(handle_pre_auth_request))
-        .route("/api/connections",             get(list_connections))
-        .route("/api/connections/{stream_id}", delete(disconnect_connection))
-        .with_state(state);
+        .route("/api/manager/pre-auth", post(handle_pre_auth_request))
+        .with_state(cache);
 
     info!("Server management API listening on {}", bind_addr);
     match tokio::net::TcpListener::bind(&bind_addr).await {
@@ -253,34 +174,10 @@ async fn main() -> Result<()> {
     // Shared pre-auth cache: populated by manager, consumed on client connect.
     let pre_auth_cache: PreAuthCache = Arc::new(RwLock::new(HashMap::new()));
 
-    // Global connection registry: tracks all active player sessions.
-    let conn_registry: ConnRegistry = Arc::new(RwLock::new(HashMap::new()));
-
-    // Rate-update task: recalculates bytes_in/out_per_sec every second.
-    let registry_rates = Arc::clone(&conn_registry);
-    tokio::spawn(async move {
-        let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(1));
-        loop {
-            interval.tick().await;
-            let reg = registry_rates.read().await;
-            for entry in reg.values() {
-                let bi = entry.bytes_in.load(Ordering::Relaxed);
-                let bo = entry.bytes_out.load(Ordering::Relaxed);
-                let prev_bi = entry.prev_bytes_in.swap(bi, Ordering::Relaxed);
-                let prev_bo = entry.prev_bytes_out.swap(bo, Ordering::Relaxed);
-                entry.bytes_in_per_sec.store(bi.saturating_sub(prev_bi), Ordering::Relaxed);
-                entry.bytes_out_per_sec.store(bo.saturating_sub(prev_bo), Ordering::Relaxed);
-            }
-        }
-    });
-
-    // Start management HTTP server (pre-auth + connection management).
-    let mgmt_state = Arc::new(MgmtState {
-        pre_auth:    Arc::clone(&pre_auth_cache),
-        connections: Arc::clone(&conn_registry),
-    });
+    // Start management HTTP server so manager can push pre-auth entries.
+    let mgmt_cache = Arc::clone(&pre_auth_cache);
     let mgmt_addr = config.mgmt_bind_address.clone();
-    tokio::spawn(start_mgmt_server(mgmt_addr, mgmt_state));
+    tokio::spawn(start_mgmt_server(mgmt_addr, mgmt_cache));
 
     // Periodically remove expired cache entries.
     let cleanup_cache = Arc::clone(&pre_auth_cache);
@@ -309,13 +206,12 @@ async fn main() -> Result<()> {
         let config = config.clone();
         let public_bind = public_bind.clone();
         let cache = Arc::clone(&pre_auth_cache);
-        let registry = Arc::clone(&conn_registry);
 
         tokio::spawn(async move {
             match acceptor.accept(tcp_stream).await {
                 Ok(tls_stream) => {
                     info!("Client {} TLS handshake complete", addr);
-                    if let Err(e) = handle_client(tls_stream, addr, &config, &public_bind, cache, registry).await {
+                    if let Err(e) = handle_client(tls_stream, addr, &config, &public_bind, cache).await {
                         let msg = e.to_string();
                         if msg.contains("close_notify") || msg.contains("peer closed") || msg.contains("idle timeout") {
                             // Expected disconnects – silent.
@@ -366,7 +262,6 @@ async fn handle_client(
     config: &ServerConfig,
     public_bind: &str,
     pre_auth_cache: PreAuthCache,
-    conn_registry: ConnRegistry,
 ) -> Result<()> {
     let (mut read_half, mut write_half) = tokio::io::split(stream);
 
@@ -441,8 +336,7 @@ async fn handle_client(
     }
 
     let state = Arc::new(RwLock::new(ServerState {
-        tunnels: HashMap::new(), tunnel_db_ids: HashMap::new(),
-        streams: HashMap::new(), udp_peers: HashMap::new(),
+        tunnels: HashMap::new(), streams: HashMap::new(), udp_peers: HashMap::new(),
         stream_tunnel: HashMap::new(), public_bind_address: public_bind.to_string(),
     }));
 
@@ -470,7 +364,7 @@ async fn handle_client(
                 Err(_) => { warn!("Client {} idle timeout", addr); anyhow::bail!("idle timeout"); }
             };
             match frame {
-                Frame::Control(msg) => { handle_control_message(msg, addr, &state_clone, &write_tx_clone, &conn_registry).await?; }
+                Frame::Control(msg) => { handle_control_message(msg, addr, &state_clone, &write_tx_clone).await?; }
                 Frame::Data { stream_id, payload } => {
                     let tcp_tx = { state_clone.read().await.streams.get(&stream_id).map(|s| s.tx.clone()) };
                     if let Some(tx) = tcp_tx {
@@ -500,10 +394,9 @@ async fn handle_client(
 async fn handle_control_message(
     msg: Message, client_addr: SocketAddr,
     state: &Arc<RwLock<ServerState>>, write_tx: &mpsc::Sender<Frame>,
-    conn_registry: &ConnRegistry,
 ) -> Result<()> {
     match msg {
-        Message::OpenTunnel { tunnel_id, remote_port, protocol, db_id } => {
+        Message::OpenTunnel { tunnel_id, remote_port, protocol, db_id: _ } => {
             if !is_valid_game_port(remote_port) {
                 warn!("Invalid port {} from {}", remote_port, client_addr);
                 let _ = write_tx.send(Frame::Control(Message::CloseTunnel { tunnel_id })).await;
@@ -528,7 +421,6 @@ async fn handle_control_message(
                 info!("Listening on {} (TCP)", addr_str);
                 let state_tcp = Arc::clone(state);
                 let write_tx_tcp = write_tx.clone();
-                let registry_tcp = Arc::clone(conn_registry);
                 let mut shutdown = shutdown_rx.clone();
                 tokio::spawn(async move {
                     loop { tokio::select! {
@@ -539,30 +431,10 @@ async fn handle_control_message(
                                 let stream_id = STREAM_ID_COUNTER.fetch_add(1, Ordering::Relaxed);
                                 debug!("Player {} connected (stream {} TCP)", peer, stream_id);
                                 let (player_tx, player_rx) = mpsc::channel::<Vec<u8>>(2048);
-                                let (stream_shutdown_tx, stream_shutdown_rx) = watch::channel(false);
-                                let bytes_in  = Arc::new(AtomicU64::new(0));
-                                let bytes_out = Arc::new(AtomicU64::new(0));
-                                let db_id = state_tcp.read().await.tunnel_db_ids.get(&tunnel_id).copied().unwrap_or(0);
-                                registry_tcp.write().await.insert(stream_id, ConnEntry {
-                                    db_id, tunnel_id,
-                                    peer_ip: peer.to_string(),
-                                    connected_at: Instant::now(),
-                                    bytes_in:  Arc::clone(&bytes_in),
-                                    bytes_out: Arc::clone(&bytes_out),
-                                    bytes_in_per_sec:  Arc::new(AtomicU64::new(0)),
-                                    bytes_out_per_sec: Arc::new(AtomicU64::new(0)),
-                                    prev_bytes_in:  Arc::new(AtomicU64::new(0)),
-                                    prev_bytes_out: Arc::new(AtomicU64::new(0)),
-                                    shutdown_tx: stream_shutdown_tx,
-                                });
                                 { let mut st = state_tcp.write().await; st.streams.insert(stream_id, PlayerStream { tx: player_tx }); st.stream_tunnel.insert(stream_id, tunnel_id); }
                                 let _ = write_tx_tcp.send(Frame::Control(Message::NewConnection { tunnel_id, stream_id, is_udp: false })).await;
-                                let wtx = write_tx_tcp.clone();
-                                let st  = Arc::clone(&state_tcp);
-                                let reg = Arc::clone(&registry_tcp);
-                                tokio::spawn(async move {
-                                    handle_player_stream(player_stream, stream_id, player_rx, wtx, st, bytes_in, bytes_out, stream_shutdown_rx, reg).await;
-                                });
+                                let wtx = write_tx_tcp.clone(); let st = Arc::clone(&state_tcp);
+                                tokio::spawn(async move { handle_player_stream(player_stream, stream_id, player_rx, wtx, st).await; });
                             }
                             Err(e) => { error!("Accept error: {:?}", e); }
                         }}
@@ -584,13 +456,10 @@ async fn handle_control_message(
                 info!("Listening on {} (UDP)", addr_str);
                 let write_tx_udp = write_tx.clone();
                 let state_udp = Arc::clone(state);
-                let registry_udp = Arc::clone(conn_registry);
                 let mut shutdown = shutdown_rx.clone();
                 tokio::spawn(async move {
                     let mut buf = vec![0u8; 65535];
                     let mut peer_streams: HashMap<std::net::SocketAddr, u64> = HashMap::new();
-                    let mut peer_bytes_in:  HashMap<u64, Arc<AtomicU64>> = HashMap::new();
-                    let mut peer_shutdown:  HashMap<u64, watch::Receiver<bool>> = HashMap::new();
                     let mut last_seen: HashMap<std::net::SocketAddr, std::time::Instant> = HashMap::new();
                     let mut cleanup_interval = tokio::time::interval(tokio::time::Duration::from_secs(10));
                     loop { tokio::select! {
@@ -598,59 +467,41 @@ async fn handle_control_message(
                             Ok((len, peer_addr)) => {
                                 last_seen.insert(peer_addr, std::time::Instant::now());
                                 let stream_id = if let Some(&sid) = peer_streams.get(&peer_addr) {
-                                    // Check if this stream was force-disconnected.
-                                    if peer_shutdown.get(&sid).map(|r| *r.borrow()).unwrap_or(false) {
-                                        peer_streams.remove(&peer_addr);
-                                        peer_bytes_in.remove(&sid);
-                                        peer_shutdown.remove(&sid);
-                                        last_seen.remove(&peer_addr);
-                                        registry_udp.write().await.remove(&sid);
-                                        { let mut st = state_udp.write().await; st.udp_peers.remove(&sid); st.stream_tunnel.remove(&sid); }
-                                        let _ = write_tx_udp.send(Frame::StreamClose { stream_id: sid }).await;
-                                        u64::MAX // create new stream below
-                                    } else { sid }
+                                    sid
                                 } else {
                                     // NAT-rebinding detection: same IP, different port.
+                                    // Some routers/CGNAT reassign the UDP source port within
+                                    // seconds.  Instead of creating a new session (which would
+                                    // break the in-progress game connection), we update the
+                                    // existing session to use the new address.
                                     let rebind = peer_streams.iter()
                                         .find(|(a, _)| a.ip() == peer_addr.ip())
                                         .map(|(a, &sid)| (*a, sid));
+
                                     if let Some((old_addr, existing_sid)) = rebind {
-                                        info!("UDP NAT rebind: {} → {} (stream {})", old_addr, peer_addr, existing_sid);
+                                        info!("UDP NAT rebind detected: {} → {} (stream {})",
+                                              old_addr, peer_addr, existing_sid);
                                         peer_streams.remove(&old_addr);
                                         last_seen.remove(&old_addr);
                                         peer_streams.insert(peer_addr, existing_sid);
                                         last_seen.insert(peer_addr, std::time::Instant::now());
-                                        { let mut st = state_udp.write().await; st.udp_peers.insert(existing_sid, UdpPeer { addr: peer_addr, socket: Arc::clone(&socket) }); }
+                                        // Update the stored peer address so responses go to new port.
+                                        {
+                                            let mut st = state_udp.write().await;
+                                            st.udp_peers.insert(existing_sid, UdpPeer {
+                                                addr: peer_addr, socket: Arc::clone(&socket),
+                                            });
+                                        }
                                         existing_sid
-                                    } else { u64::MAX }
+                                    } else {
+                                        // Genuinely new player connection.
+                                        let sid = STREAM_ID_COUNTER.fetch_add(1, Ordering::Relaxed);
+                                        peer_streams.insert(peer_addr, sid);
+                                        { let mut st = state_udp.write().await; st.udp_peers.insert(sid, UdpPeer { addr: peer_addr, socket: Arc::clone(&socket) }); st.stream_tunnel.insert(sid, tunnel_id); }
+                                        let _ = write_tx_udp.send(Frame::Control(Message::NewConnection { tunnel_id, stream_id: sid, is_udp: true })).await;
+                                        sid
+                                    }
                                 };
-
-                                let stream_id = if stream_id == u64::MAX || !peer_streams.contains_key(&peer_addr) {
-                                    let sid = STREAM_ID_COUNTER.fetch_add(1, Ordering::Relaxed);
-                                    let bi = Arc::new(AtomicU64::new(0));
-                                    let (shutdown_tx, shutdown_rx_peer) = watch::channel(false);
-                                    let db_id = state_udp.read().await.tunnel_db_ids.get(&tunnel_id).copied().unwrap_or(0);
-                                    registry_udp.write().await.insert(sid, ConnEntry {
-                                        db_id, tunnel_id,
-                                        peer_ip: peer_addr.to_string(),
-                                        connected_at: Instant::now(),
-                                        bytes_in:  Arc::clone(&bi),
-                                        bytes_out: Arc::new(AtomicU64::new(0)),
-                                        bytes_in_per_sec:  Arc::new(AtomicU64::new(0)),
-                                        bytes_out_per_sec: Arc::new(AtomicU64::new(0)),
-                                        prev_bytes_in:  Arc::new(AtomicU64::new(0)),
-                                        prev_bytes_out: Arc::new(AtomicU64::new(0)),
-                                        shutdown_tx,
-                                    });
-                                    peer_streams.insert(peer_addr, sid);
-                                    peer_bytes_in.insert(sid, Arc::clone(&bi));
-                                    peer_shutdown.insert(sid, shutdown_rx_peer);
-                                    { let mut st = state_udp.write().await; st.udp_peers.insert(sid, UdpPeer { addr: peer_addr, socket: Arc::clone(&socket) }); st.stream_tunnel.insert(sid, tunnel_id); }
-                                    let _ = write_tx_udp.send(Frame::Control(Message::NewConnection { tunnel_id, stream_id: sid, is_udp: true })).await;
-                                    sid
-                                } else { stream_id };
-
-                                if let Some(bi) = peer_bytes_in.get(&stream_id) { bi.fetch_add(len as u64, Ordering::Relaxed); }
                                 let _ = write_tx_udp.send(Frame::Data { stream_id, payload: buf[..len].to_vec() }).await;
                             }
                             Err(e) => { error!("UDP recv error: {:?}", e); break; }
@@ -664,10 +515,10 @@ async fn handle_control_message(
                             for addr in stale {
                                 last_seen.remove(&addr);
                                 if let Some(sid) = peer_streams.remove(&addr) {
-                                    peer_bytes_in.remove(&sid);
-                                    peer_shutdown.remove(&sid);
-                                    registry_udp.write().await.remove(&sid);
-                                    { let mut st = state_udp.write().await; st.udp_peers.remove(&sid); st.stream_tunnel.remove(&sid); }
+                                    { let mut st = state_udp.write().await;
+                                        st.udp_peers.remove(&sid);
+                                        st.stream_tunnel.remove(&sid);
+                                    }
                                     let _ = write_tx_udp.send(Frame::StreamClose { stream_id: sid }).await;
                                     info!("UDP: stale session removed for {} (stream {})", addr, sid);
                                 }
@@ -678,29 +529,15 @@ async fn handle_control_message(
                 });
             }
 
-            {
-                let mut st = state.write().await;
-                st.tunnels.insert(tunnel_id, ActiveTunnel { tunnel_id, remote_port, protocol, shutdown_tx });
-                st.tunnel_db_ids.insert(tunnel_id, db_id);
-            }
+            { state.write().await.tunnels.insert(tunnel_id, ActiveTunnel { tunnel_id, remote_port, protocol, shutdown_tx }); }
             write_tx.send(Frame::Control(Message::TunnelOpened { tunnel_id })).await.context("send TunnelOpened")?;
         }
         Message::CloseTunnel { tunnel_id } => {
             info!("Closing tunnel {}", tunnel_id);
-            let sids: Vec<u64> = {
-                let mut st = state.write().await;
-                if let Some(t) = st.tunnels.remove(&tunnel_id) { let _ = t.shutdown_tx.send(true); }
-                st.tunnel_db_ids.remove(&tunnel_id);
-                let sids: Vec<u64> = st.stream_tunnel.iter()
-                    .filter(|(_, &tid)| tid == tunnel_id).map(|(&sid, _)| sid).collect();
-                for sid in &sids { st.streams.remove(sid); st.udp_peers.remove(sid); st.stream_tunnel.remove(sid); }
-                sids
-            };
-            let mut reg = conn_registry.write().await;
-            for sid in &sids {
-                if let Some(e) = reg.remove(sid) { let _ = e.shutdown_tx.send(true); }
-                let _ = write_tx.send(Frame::StreamClose { stream_id: *sid }).await;
-            }
+            let mut st = state.write().await;
+            if let Some(t) = st.tunnels.remove(&tunnel_id) { let _ = t.shutdown_tx.send(true); }
+            let sids: Vec<u64> = st.stream_tunnel.iter().filter(|(_, &tid)| tid == tunnel_id).map(|(&sid, _)| sid).collect();
+            for sid in &sids { st.streams.remove(sid); st.udp_peers.remove(sid); st.stream_tunnel.remove(sid); let _ = write_tx.send(Frame::StreamClose { stream_id: *sid }).await; }
             if !sids.is_empty() { info!("Closed {} connections for tunnel {}", sids.len(), tunnel_id); }
         }
         Message::Ping => { let _ = write_tx.try_send(Frame::Control(Message::Pong)); }
@@ -714,42 +551,24 @@ async fn handle_player_stream(
     mut from_tunnel: mpsc::Receiver<Vec<u8>>,
     to_tunnel: mpsc::Sender<Frame>,
     state: Arc<RwLock<ServerState>>,
-    bytes_in: Arc<AtomicU64>,
-    bytes_out: Arc<AtomicU64>,
-    mut shutdown_rx: watch::Receiver<bool>,
-    registry: ConnRegistry,
 ) {
     let (mut pr, mut pw) = player.into_split();
     let to_tunnel_r = to_tunnel.clone();
-    let bi = Arc::clone(&bytes_in);
     let read_task = tokio::spawn(async move {
         let mut buf = vec![0u8; 65536];
         loop {
             match pr.read(&mut buf).await {
                 Ok(0) => break,
-                Ok(n) => {
-                    bi.fetch_add(n as u64, Ordering::Relaxed);
-                    if to_tunnel_r.send(Frame::Data { stream_id, payload: buf[..n].to_vec() }).await.is_err() { break; }
-                }
+                Ok(n) => { if to_tunnel_r.send(Frame::Data { stream_id, payload: buf[..n].to_vec() }).await.is_err() { break; } }
                 Err(_) => break,
             }
         }
     });
-    let bo = Arc::clone(&bytes_out);
     let write_task = tokio::spawn(async move {
-        while let Some(data) = from_tunnel.recv().await {
-            let n = data.len() as u64;
-            if pw.write_all(&data).await.is_err() { break; }
-            bo.fetch_add(n, Ordering::Relaxed);
-        }
+        while let Some(data) = from_tunnel.recv().await { if pw.write_all(&data).await.is_err() { break; } }
     });
-    tokio::select! {
-        _ = read_task  => {}
-        _ = write_task => {}
-        _ = shutdown_rx.changed() => { debug!("Stream {} force-disconnected", stream_id); }
-    }
+    tokio::select! { _ = read_task => {} _ = write_task => {} }
     let _ = to_tunnel.send(Frame::StreamClose { stream_id }).await;
-    registry.write().await.remove(&stream_id);
     let mut st = state.write().await;
     st.streams.remove(&stream_id); st.stream_tunnel.remove(&stream_id);
 }
