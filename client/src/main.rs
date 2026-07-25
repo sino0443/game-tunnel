@@ -223,6 +223,70 @@ async fn query_servers_from_manager(
     Ok(r.server_ids)
 }
 
+/// Deserialized from the manager's `GET /api/client/{client_id}/tunnels` response.
+/// Field names must match `ClientTunnelEntry` in the manager.
+#[derive(serde::Deserialize)]
+struct ManagerTunnelEntry {
+    id: u32,
+    uuid: String,
+    name: String,
+    server_ip: String,
+    server_port: u16,
+    remote_port: u16,
+    protocol: String,
+    server_id: Option<u32>,
+    subdomain: String,
+    domain: String,
+}
+
+/// Fetches the list of tunnels assigned to this client from the manager API.
+/// Replaces the direct database query so the client no longer needs read
+/// access to the tunnels table.
+async fn query_tunnels_from_manager(
+    http_client: &reqwest::Client,
+    manager_url: &str,
+    client_id: &str,
+) -> Result<Vec<DbTunnel>> {
+    let url = format!(
+        "{}/api/client/{}/tunnels",
+        manager_url.trim_end_matches('/'),
+        client_id
+    );
+    let resp = http_client
+        .get(&url)
+        .send()
+        .await
+        .context("manager tunnel request failed")?;
+
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        anyhow::bail!("manager returned HTTP {}: {}", status, body.trim());
+    }
+
+    let entries = resp
+        .json::<Vec<ManagerTunnelEntry>>()
+        .await
+        .context("failed to parse manager tunnel response")?;
+
+    Ok(entries
+        .into_iter()
+        .map(|e| DbTunnel {
+            id:          e.id,
+            uuid:        e.uuid,
+            name:        e.name,
+            online:      true, // manager only returns online tunnels
+            server_ip:   e.server_ip,
+            server_port: e.server_port,
+            remote_port: e.remote_port,
+            protocol:    e.protocol,
+            server_id:   e.server_id,
+            subdomain:   e.subdomain,
+            domain:      e.domain,
+        })
+        .collect())
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt().with_env_filter(
@@ -515,14 +579,17 @@ async fn run_client(config: ClientConfig) -> Result<()> {
         }
     });
 
-    // DB polling loop: keeps tunnel state in sync and writes status updates.
-    let db_poll_state = Arc::clone(&state);
-    let db_poll_servers = Arc::clone(&servers);
-    let db_poll_pool = db_pool.clone();
-    let server_entries = config.servers.clone();
-    let poll_interval = config.database.poll_interval_secs;
-    let stats_for_db = stats.clone();
-    let client_id = config.client_id.clone();
+    // Polling loop: writes tunnel status to DB and syncs tunnel state from
+    // the manager API.
+    let db_poll_state      = Arc::clone(&state);
+    let db_poll_servers    = Arc::clone(&servers);
+    let db_poll_pool       = db_pool.clone();
+    let db_poll_http       = http_client.clone();
+    let db_poll_manager    = config.manager_url.clone();
+    let server_entries     = config.servers.clone();
+    let poll_interval      = config.database.poll_interval_secs;
+    let stats_for_db       = stats.clone();
+    let client_id          = config.client_id.clone();
 
     let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(poll_interval));
     loop {
@@ -532,11 +599,12 @@ async fn run_client(config: ClientConfig) -> Result<()> {
         ).await {
             error!("Status write error: {:?}", e);
         }
-        if let Err(e) = sync_tunnels_from_db(
-            &db_poll_pool, &db_poll_state, &db_poll_servers,
+        if let Err(e) = sync_tunnels(
+            &db_poll_pool, &db_poll_http, &db_poll_manager,
+            &db_poll_state, &db_poll_servers,
             &server_entries, &stats_for_db, &client_id,
         ).await {
-            error!("DB sync error: {:?}", e);
+            error!("Tunnel sync error: {:?}", e);
         }
     }
 }
@@ -561,15 +629,19 @@ async fn write_status_to_db(
     Ok(())
 }
 
-async fn sync_tunnels_from_db(
+/// Syncs the client's active tunnel set against the manager API.
+/// Replaces the former `sync_tunnels_from_db` which read directly from MySQL.
+async fn sync_tunnels(
     pool: &sqlx::MySqlPool,
+    http_client: &reqwest::Client,
+    manager_url: &str,
     state: &Arc<RwLock<ClientState>>,
     servers: &Arc<RwLock<HashMap<u32, ServerConnection>>>,
     server_entries: &[ServerEntry],
     stats: &Stats,
     client_id: &str,
 ) -> Result<()> {
-    let db_tunnels = database::get_client_tunnels(pool, client_id).await?;
+    let db_tunnels = query_tunnels_from_manager(http_client, manager_url, client_id).await?;
 
     let (to_add, to_remove, to_update) = {
         let st = state.read().await;

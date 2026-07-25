@@ -167,6 +167,7 @@ async fn main() -> Result<()> {
                delete(disconnect_tunnel_connection))
         .route("/api/client/{uuid}/server",  get(get_server_for_client))
         .route("/api/client/{uuid}/servers", get(get_servers_for_client))
+        .route("/api/client/{client_id}/tunnels", get(list_client_tunnels))
         .layer(CorsLayer::permissive())
         .with_state(state);
 
@@ -756,4 +757,54 @@ async fn get_servers_for_client(
     );
 
     Ok(Json(ServerAssignmentsResponse { server_ids }))
+}
+
+// ── Client tunnel list endpoint ───────────────────────────────────────────────
+
+/// Wire format sent to the client for each tunnel.
+/// Matches `DbTunnel` on the client side.
+#[derive(Serialize)]
+struct ClientTunnelEntry {
+    id: u32,
+    uuid: String,
+    name: String,
+    server_ip: String,
+    server_port: u16,
+    remote_port: u16,
+    protocol: String,
+    server_id: Option<u32>,
+    subdomain: String,
+    domain: String,
+}
+
+/// `GET /api/client/{client_id}/tunnels`
+///
+/// Returns all online tunnels assigned to the given client_id, with every
+/// field the client needs to open its tunnels (server_ip, server_port, …).
+/// The client calls this endpoint instead of querying the database directly.
+async fn list_client_tunnels(
+    Path(client_id): Path<String>,
+    State(state): State<Arc<AppState>>,
+) -> impl IntoResponse {
+    match database::get_tunnels_for_client(&state.db, &client_id).await {
+        Ok(rows) => {
+            let entries: Vec<ClientTunnelEntry> = rows.into_iter().map(|t| ClientTunnelEntry {
+                id:          t.id,
+                uuid:        t.uuid,
+                name:        t.name,
+                server_ip:   t.server_ip,
+                server_port: t.server_port,
+                remote_port: t.remote_port,
+                protocol:    t.protocol,
+                server_id:   t.server_id,
+                subdomain:   t.subdomain,
+                domain:      t.domain,
+            }).collect();
+            Json(entries).into_response()
+        }
+        Err(e) => {
+            error!("Failed to fetch tunnels for client '{}': {:?}", client_id, e);
+            (StatusCode::INTERNAL_SERVER_ERROR, format!("{}", e)).into_response()
+        }
+    }
 }

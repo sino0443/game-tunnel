@@ -296,6 +296,43 @@ pub async fn upsert_client_server_mapping(
     Ok(res.rows_affected() >= 1)
 }
 
+/// Full tunnel data returned to a client via the manager API.
+/// Contains all fields the client needs to open and manage its tunnels.
+pub struct ClientTunnelRow {
+    pub id: u32,
+    pub uuid: String,
+    pub name: String,
+    pub server_ip: String,
+    pub server_port: u16,
+    pub remote_port: u16,
+    pub protocol: String,
+    pub server_id: Option<u32>,
+    pub subdomain: String,
+    pub domain: String,
+}
+
+/// Returns all online tunnels assigned to `client_id`, with every field the
+/// client needs to open connections (server_ip, server_port, protocol, …).
+pub async fn get_tunnels_for_client(pool: &MySqlPool, client_id: &str) -> Result<Vec<ClientTunnelRow>> {
+    let rows = sqlx::query(
+        "SELECT id, uuid, name, server_ip, server_port, remote_port, protocol, \
+         server_id, subdomain, domain \
+         FROM tunnels WHERE online = TRUE AND client_id = ?"
+    ).bind(client_id).fetch_all(pool).await?;
+    Ok(rows.iter().map(|r| ClientTunnelRow {
+        id:          r.try_get("id").unwrap_or(0),
+        uuid:        r.try_get("uuid").unwrap_or_default(),
+        name:        r.try_get("name").unwrap_or_default(),
+        server_ip:   r.try_get("server_ip").unwrap_or_default(),
+        server_port: r.try_get("server_port").unwrap_or(0),
+        remote_port: r.try_get("remote_port").unwrap_or(0),
+        protocol:    r.try_get("protocol").unwrap_or_default(),
+        server_id:   r.try_get::<Option<u32>, _>("server_id").unwrap_or(None),
+        subdomain:   r.try_get("subdomain").unwrap_or_default(),
+        domain:      r.try_get("domain").unwrap_or_default(),
+    }).collect())
+}
+
 pub struct TunnelRow {
     pub id: u32, pub name: String, pub subdomain: String, pub domain: String,
     pub online: bool, pub client_id: Option<String>, pub server_id: Option<u32>,
