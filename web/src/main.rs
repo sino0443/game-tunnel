@@ -317,11 +317,15 @@ async fn delete_tunnel(State(state): State<Arc<AppState>>, Path(id): Path<u32>) 
 }
 
 async fn start_tunnel(State(state): State<Arc<AppState>>, Path(id): Path<u32>) -> impl IntoResponse {
-    // Reset dns_set so the manager re-configures DNS (server may have changed),
-    // and reset client_id so the manager re-assigns the tunnel to a client.
+    // Reset dns_set so the manager re-configures DNS (server may have changed).
     // tunnel_status is set to 'starting' so the UI shows transitional state.
+    // client_id is intentionally NOT reset: if the tunnel already has a client
+    // assigned (dynamically or manually), that assignment must persist across
+    // stop/start cycles.  The manager only auto-assigns when client_id IS NULL,
+    // so a brand-new tunnel (client_id = NULL) will still get a dynamic
+    // assignment on its first start.
     match sqlx::query(
-        "UPDATE tunnels SET online = TRUE, client_id = NULL, dns_set = FALSE, tunnel_status = 'starting' WHERE id = ?",
+        "UPDATE tunnels SET online = TRUE, dns_set = FALSE, tunnel_status = 'starting' WHERE id = ?",
     )
     .bind(id)
     .execute(&state.db)
@@ -333,7 +337,9 @@ async fn start_tunnel(State(state): State<Arc<AppState>>, Path(id): Path<u32>) -
 }
 
 async fn stop_tunnel(State(state): State<Arc<AppState>>, Path(id): Path<u32>) -> impl IntoResponse {
-    match sqlx::query("UPDATE tunnels SET online = FALSE, tunnel_status = 'stopped', client_id = NULL WHERE id = ?").bind(id).execute(&state.db).await {
+    // client_id is intentionally NOT reset on stop so the assignment is
+    // preserved when the tunnel is started again later.
+    match sqlx::query("UPDATE tunnels SET online = FALSE, tunnel_status = 'stopped' WHERE id = ?").bind(id).execute(&state.db).await {
         Ok(_) => Json(serde_json::json!({"message": "Stopped"})).into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("{}", e)).into_response(),
     }
