@@ -13,11 +13,15 @@ pub struct ClientConfig {
     pub client_name: String,
     /// Base URL of the manager API (e.g. "http://manager:8080").
     pub manager_url: String,
-    pub database: DatabaseConfig,
+    /// How often (in seconds) the client polls the manager for tunnel changes
+    /// and reports status back.  Defaults to 5.
+    #[serde(default = "default_client_poll")]
+    pub poll_interval_secs: u64,
     /// Server connection details (TLS CA, address, secret). The manager
     /// decides which server_id to use; the client looks up the entry here.
     pub servers: Vec<ServerEntry>,
 }
+fn default_client_poll() -> u64 { 5 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ServerEntry {
