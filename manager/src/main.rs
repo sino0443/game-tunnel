@@ -4,7 +4,7 @@ use axum::Router;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Json};
-use axum::routing::{delete, get};
+use axum::routing::{delete, get, post};
 use game_tunnel_shared::config::{CloudflareConfig, ManagerConfig};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
