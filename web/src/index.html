@@ -984,7 +984,6 @@ function renderConnections(conns) {
 }
 
 async function disconnectConn(dbId, streamId, ip) {
-  if (!confirm('Verbindung von ' + ip + ' trennen?')) return;
   try {
     const r = await fetch(API + '/api/tunnels/' + dbId + '/connections/' + streamId, { method: 'DELETE' });
     toast(r.ok ? ip + ' getrennt' : 'Fehler: ' + r.status, r.ok ? 'ok' : 'err');
