@@ -60,6 +60,14 @@ struct ConnInfo {
     bytes_in: Arc<AtomicU64>,
     /// Bytes sent TO the player (received from the game server).
     bytes_out: Arc<AtomicU64>,
+    /// Current 1-second receive rate (updated by the rate-tick background task).
+    bytes_in_per_sec: Arc<AtomicU64>,
+    /// Current 1-second send rate (updated by the rate-tick background task).
+    bytes_out_per_sec: Arc<AtomicU64>,
+    /// Previous-sample bytes_in used to compute per-second delta.
+    prev_bytes_in: Arc<AtomicU64>,
+    /// Previous-sample bytes_out used to compute per-second delta.
+    prev_bytes_out: Arc<AtomicU64>,
     /// Send `true` to force-close this player connection.
     shutdown_tx: watch::Sender<bool>,
 }
@@ -178,21 +186,16 @@ async fn handle_list_connections(
 ) -> Json<Vec<ConnData>> {
     let tracker = state.conn_tracker.read().await;
     let conns: Vec<ConnData> = tracker.iter().map(|(&stream_id, info)| {
-        let elapsed = info.connected_at.elapsed().as_secs().max(1);
-        let bytes_in  = info.bytes_in.load(Ordering::Relaxed);
-        let bytes_out = info.bytes_out.load(Ordering::Relaxed);
         ConnData {
             stream_id,
             db_id:            info.db_id,
             tunnel_id:        info.tunnel_id,
             peer_ip:          info.peer_ip.clone(),
-            bytes_in,
-            bytes_out,
-            // Average rate since connection start — gives a reasonable
-            // throughput indicator without needing a rolling-window task.
-            bytes_in_per_sec:  bytes_in  / elapsed,
-            bytes_out_per_sec: bytes_out / elapsed,
-            connected_secs:   elapsed,
+            bytes_in:          info.bytes_in.load(Ordering::Relaxed),
+            bytes_out:         info.bytes_out.load(Ordering::Relaxed),
+            bytes_in_per_sec:  info.bytes_in_per_sec.load(Ordering::Relaxed),
+            bytes_out_per_sec: info.bytes_out_per_sec.load(Ordering::Relaxed),
+            connected_secs:   info.connected_at.elapsed().as_secs(),
         }
     }).collect();
     Json(conns)
@@ -221,8 +224,8 @@ async fn start_mgmt_server(bind_addr: String, pre_auth: PreAuthCache, conn_track
     let state = MgmtState { pre_auth, conn_tracker };
     let app = Router::new()
         .route("/api/manager/pre-auth", post(handle_pre_auth_request))
-        .route("/api/connections",            get(handle_list_connections))
-        .route("/api/connections/:stream_id", delete(handle_disconnect_connection))
+        .route("/api/connections",             get(handle_list_connections))
+        .route("/api/connections/{stream_id}", delete(handle_disconnect_connection))
         .with_state(state);
 
     info!("Server management API listening on {}", bind_addr);
@@ -274,6 +277,25 @@ async fn main() -> Result<()> {
     // Shared connection tracker: updated by player connection handlers,
     // read by the management HTTP server's /api/connections endpoint.
     let conn_tracker: ConnTracker = Arc::new(RwLock::new(HashMap::new()));
+
+    // Rate-update task: recalculates bytes_in/out_per_sec every second by
+    // comparing the current cumulative byte counts against the previous sample.
+    let tracker_rates = Arc::clone(&conn_tracker);
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(1));
+        loop {
+            interval.tick().await;
+            let tracker = tracker_rates.read().await;
+            for info in tracker.values() {
+                let bi = info.bytes_in.load(Ordering::Relaxed);
+                let bo = info.bytes_out.load(Ordering::Relaxed);
+                let prev_bi = info.prev_bytes_in.swap(bi, Ordering::Relaxed);
+                let prev_bo = info.prev_bytes_out.swap(bo, Ordering::Relaxed);
+                info.bytes_in_per_sec.store(bi.saturating_sub(prev_bi), Ordering::Relaxed);
+                info.bytes_out_per_sec.store(bo.saturating_sub(prev_bo), Ordering::Relaxed);
+            }
+        }
+    });
 
     // Start management HTTP server so manager can push pre-auth entries
     // and poll live connection data.
@@ -550,13 +572,17 @@ async fn handle_control_message(
                                 {
                                     let mut tr = tracker_tcp.write().await;
                                     tr.insert(stream_id, ConnInfo {
-                                        peer_ip:      peer.to_string(),
+                                        peer_ip:           peer.to_string(),
                                         db_id,
                                         tunnel_id,
-                                        connected_at: Instant::now(),
-                                        bytes_in:     Arc::clone(&bytes_in),
-                                        bytes_out:    Arc::clone(&bytes_out),
-                                        shutdown_tx:  conn_shutdown_tx,
+                                        connected_at:      Instant::now(),
+                                        bytes_in:          Arc::clone(&bytes_in),
+                                        bytes_out:         Arc::clone(&bytes_out),
+                                        bytes_in_per_sec:  Arc::new(AtomicU64::new(0)),
+                                        bytes_out_per_sec: Arc::new(AtomicU64::new(0)),
+                                        prev_bytes_in:     Arc::new(AtomicU64::new(0)),
+                                        prev_bytes_out:    Arc::new(AtomicU64::new(0)),
+                                        shutdown_tx:       conn_shutdown_tx,
                                     });
                                 }
 
