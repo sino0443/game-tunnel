@@ -1,10 +1,11 @@
 use anyhow::{Context, Result};
-use axum::extract::State;
-use axum::routing::post;
+use axum::extract::{Path, State};
+use axum::http::StatusCode;
+use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use game_tunnel_shared::config::ServerConfig;
 use game_tunnel_shared::protocol::{self, Frame, Message, TunnelProtocol};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::BufReader;
@@ -43,6 +44,51 @@ const PRE_AUTH_TTL_SECS: u64 = 10;
 /// manager granted the pre-authorization.
 type PreAuthCache = Arc<RwLock<HashMap<String, Instant>>>;
 
+/// Per-player-connection tracking data.  Shared between the connection
+/// handler (which updates byte counters) and the management HTTP server
+/// (which exposes them via `GET /api/connections`).
+struct ConnInfo {
+    /// Real player IP:port (from the TCP accept / UDP recv).
+    peer_ip: String,
+    /// Database row id of the tunnel (from the OpenTunnel message).
+    db_id: u32,
+    /// Internal wire tunnel_id.
+    tunnel_id: u32,
+    /// When the connection was established.
+    connected_at: Instant,
+    /// Bytes received FROM the player (forwarded to the game server).
+    bytes_in: Arc<AtomicU64>,
+    /// Bytes sent TO the player (received from the game server).
+    bytes_out: Arc<AtomicU64>,
+    /// Send `true` to force-close this player connection.
+    shutdown_tx: watch::Sender<bool>,
+}
+
+/// Shared live-connection map: stream_id → ConnInfo.
+type ConnTracker = Arc<RwLock<HashMap<u64, ConnInfo>>>;
+
+/// Combined state for the management HTTP server (pre-auth cache + connections).
+#[derive(Clone)]
+struct MgmtState {
+    pre_auth: PreAuthCache,
+    conn_tracker: ConnTracker,
+}
+
+/// JSON shape returned by `GET /api/connections` (matches `ServerConnData` in manager).
+#[derive(Serialize)]
+struct ConnData {
+    stream_id: u64,
+    db_id: u32,
+    #[allow(dead_code)]
+    tunnel_id: u32,
+    peer_ip: String,
+    bytes_in: u64,
+    bytes_out: u64,
+    bytes_in_per_sec: u64,
+    bytes_out_per_sec: u64,
+    connected_secs: u64,
+}
+
 struct ActiveTunnel {
     #[allow(dead_code)] tunnel_id: u32,
     #[allow(dead_code)] remote_port: u16,
@@ -58,6 +104,8 @@ struct ServerState {
     streams: HashMap<u64, PlayerStream>,
     udp_peers: HashMap<u64, UdpPeer>,
     stream_tunnel: HashMap<u64, u32>,
+    /// Maps wire tunnel_id → database row id (from OpenTunnel.db_id).
+    tunnel_db_id: HashMap<u32, u32>,
     public_bind_address: String,
 }
 
@@ -112,21 +160,70 @@ struct PreAuthRequest {
 /// Called by the manager to notify the server that a client with the given
 /// UUID is expected to connect within the next `PRE_AUTH_TTL_SECS` seconds.
 async fn handle_pre_auth_request(
-    State(cache): State<PreAuthCache>,
+    State(state): State<MgmtState>,
     Json(req): Json<PreAuthRequest>,
 ) -> axum::http::StatusCode {
-    let mut c = cache.write().await;
+    let mut c = state.pre_auth.write().await;
     c.insert(req.client_uuid.clone(), Instant::now());
     info!("Pre-auth stored for client UUID {} (TTL: {}s)", req.client_uuid, PRE_AUTH_TTL_SECS);
     axum::http::StatusCode::OK
 }
 
+/// Handler for `GET /api/connections`.
+///
+/// Returns all currently active player connections with their statistics.
+/// The manager polls this endpoint every second to build the connection map.
+async fn handle_list_connections(
+    State(state): State<MgmtState>,
+) -> Json<Vec<ConnData>> {
+    let tracker = state.conn_tracker.read().await;
+    let conns: Vec<ConnData> = tracker.iter().map(|(&stream_id, info)| {
+        let elapsed = info.connected_at.elapsed().as_secs().max(1);
+        let bytes_in  = info.bytes_in.load(Ordering::Relaxed);
+        let bytes_out = info.bytes_out.load(Ordering::Relaxed);
+        ConnData {
+            stream_id,
+            db_id:            info.db_id,
+            tunnel_id:        info.tunnel_id,
+            peer_ip:          info.peer_ip.clone(),
+            bytes_in,
+            bytes_out,
+            // Average rate since connection start — gives a reasonable
+            // throughput indicator without needing a rolling-window task.
+            bytes_in_per_sec:  bytes_in  / elapsed,
+            bytes_out_per_sec: bytes_out / elapsed,
+            connected_secs:   elapsed,
+        }
+    }).collect();
+    Json(conns)
+}
+
+/// Handler for `DELETE /api/connections/{stream_id}`.
+///
+/// Forces a specific player connection to close.
+async fn handle_disconnect_connection(
+    State(state): State<MgmtState>,
+    Path(stream_id): Path<u64>,
+) -> StatusCode {
+    let tracker = state.conn_tracker.read().await;
+    if let Some(info) = tracker.get(&stream_id) {
+        let _ = info.shutdown_tx.send(true);
+        info!("Forced disconnect requested for stream {}", stream_id);
+        StatusCode::OK
+    } else {
+        StatusCode::NOT_FOUND
+    }
+}
+
 /// Starts the management HTTP server that listens for pre-auth notifications
-/// from the manager. This runs in a background task.
-async fn start_mgmt_server(bind_addr: String, cache: PreAuthCache) {
+/// from the manager, exposes live connection data, and supports forced disconnects.
+async fn start_mgmt_server(bind_addr: String, pre_auth: PreAuthCache, conn_tracker: ConnTracker) {
+    let state = MgmtState { pre_auth, conn_tracker };
     let app = Router::new()
         .route("/api/manager/pre-auth", post(handle_pre_auth_request))
-        .with_state(cache);
+        .route("/api/connections",            get(handle_list_connections))
+        .route("/api/connections/:stream_id", delete(handle_disconnect_connection))
+        .with_state(state);
 
     info!("Server management API listening on {}", bind_addr);
     match tokio::net::TcpListener::bind(&bind_addr).await {
@@ -174,10 +271,14 @@ async fn main() -> Result<()> {
     // Shared pre-auth cache: populated by manager, consumed on client connect.
     let pre_auth_cache: PreAuthCache = Arc::new(RwLock::new(HashMap::new()));
 
-    // Start management HTTP server so manager can push pre-auth entries.
-    let mgmt_cache = Arc::clone(&pre_auth_cache);
+    // Shared connection tracker: updated by player connection handlers,
+    // read by the management HTTP server's /api/connections endpoint.
+    let conn_tracker: ConnTracker = Arc::new(RwLock::new(HashMap::new()));
+
+    // Start management HTTP server so manager can push pre-auth entries
+    // and poll live connection data.
     let mgmt_addr = config.mgmt_bind_address.clone();
-    tokio::spawn(start_mgmt_server(mgmt_addr, mgmt_cache));
+    tokio::spawn(start_mgmt_server(mgmt_addr, Arc::clone(&pre_auth_cache), Arc::clone(&conn_tracker)));
 
     // Periodically remove expired cache entries.
     let cleanup_cache = Arc::clone(&pre_auth_cache);
@@ -206,12 +307,13 @@ async fn main() -> Result<()> {
         let config = config.clone();
         let public_bind = public_bind.clone();
         let cache = Arc::clone(&pre_auth_cache);
+        let tracker = Arc::clone(&conn_tracker);
 
         tokio::spawn(async move {
             match acceptor.accept(tcp_stream).await {
                 Ok(tls_stream) => {
                     info!("Client {} TLS handshake complete", addr);
-                    if let Err(e) = handle_client(tls_stream, addr, &config, &public_bind, cache).await {
+                    if let Err(e) = handle_client(tls_stream, addr, &config, &public_bind, cache, tracker).await {
                         let msg = e.to_string();
                         if msg.contains("close_notify") || msg.contains("peer closed") || msg.contains("idle timeout") {
                             // Expected disconnects – silent.
@@ -262,6 +364,7 @@ async fn handle_client(
     config: &ServerConfig,
     public_bind: &str,
     pre_auth_cache: PreAuthCache,
+    conn_tracker: ConnTracker,
 ) -> Result<()> {
     let (mut read_half, mut write_half) = tokio::io::split(stream);
 
@@ -337,7 +440,8 @@ async fn handle_client(
 
     let state = Arc::new(RwLock::new(ServerState {
         tunnels: HashMap::new(), streams: HashMap::new(), udp_peers: HashMap::new(),
-        stream_tunnel: HashMap::new(), public_bind_address: public_bind.to_string(),
+        stream_tunnel: HashMap::new(), tunnel_db_id: HashMap::new(),
+        public_bind_address: public_bind.to_string(),
     }));
 
     let (write_tx, mut write_rx) = mpsc::channel::<Frame>(8192);
@@ -354,6 +458,7 @@ async fn handle_client(
 
     let state_clone = Arc::clone(&state);
     let write_tx_clone = write_tx.clone();
+    let tracker_clone = Arc::clone(&conn_tracker);
     let idle_timeout = tokio::time::Duration::from_secs(CLIENT_IDLE_TIMEOUT_SECS);
 
     let result: Result<()> = async {
@@ -364,7 +469,7 @@ async fn handle_client(
                 Err(_) => { warn!("Client {} idle timeout", addr); anyhow::bail!("idle timeout"); }
             };
             match frame {
-                Frame::Control(msg) => { handle_control_message(msg, addr, &state_clone, &write_tx_clone).await?; }
+                Frame::Control(msg) => { handle_control_message(msg, addr, &state_clone, &write_tx_clone, &tracker_clone).await?; }
                 Frame::Data { stream_id, payload } => {
                     let tcp_tx = { state_clone.read().await.streams.get(&stream_id).map(|s| s.tx.clone()) };
                     if let Some(tx) = tcp_tx {
@@ -394,9 +499,10 @@ async fn handle_client(
 async fn handle_control_message(
     msg: Message, client_addr: SocketAddr,
     state: &Arc<RwLock<ServerState>>, write_tx: &mpsc::Sender<Frame>,
+    conn_tracker: &ConnTracker,
 ) -> Result<()> {
     match msg {
-        Message::OpenTunnel { tunnel_id, remote_port, protocol, db_id: _ } => {
+        Message::OpenTunnel { tunnel_id, remote_port, protocol, db_id } => {
             if !is_valid_game_port(remote_port) {
                 warn!("Invalid port {} from {}", remote_port, client_addr);
                 let _ = write_tx.send(Frame::Control(Message::CloseTunnel { tunnel_id })).await;
@@ -407,6 +513,9 @@ async fn handle_control_message(
             info!("Opening tunnel {} on port {} ({:?})", tunnel_id, remote_port, protocol);
             let (shutdown_tx, shutdown_rx) = watch::channel(false);
             let bind_addr = state.read().await.public_bind_address.clone();
+
+            // Record tunnel → db_id mapping so player connections can reference it.
+            { state.write().await.tunnel_db_id.insert(tunnel_id, db_id); }
 
             if protocol == TunnelProtocol::Tcp || protocol == TunnelProtocol::Both {
                 let addr_str = format!("{}:{}", bind_addr, remote_port);
@@ -421,6 +530,7 @@ async fn handle_control_message(
                 info!("Listening on {} (TCP)", addr_str);
                 let state_tcp = Arc::clone(state);
                 let write_tx_tcp = write_tx.clone();
+                let tracker_tcp = Arc::clone(conn_tracker);
                 let mut shutdown = shutdown_rx.clone();
                 tokio::spawn(async move {
                     loop { tokio::select! {
@@ -432,9 +542,32 @@ async fn handle_control_message(
                                 debug!("Player {} connected (stream {} TCP)", peer, stream_id);
                                 let (player_tx, player_rx) = mpsc::channel::<Vec<u8>>(2048);
                                 { let mut st = state_tcp.write().await; st.streams.insert(stream_id, PlayerStream { tx: player_tx }); st.stream_tunnel.insert(stream_id, tunnel_id); }
+
+                                // Register the connection in the tracker for /api/connections.
+                                let bytes_in  = Arc::new(AtomicU64::new(0));
+                                let bytes_out = Arc::new(AtomicU64::new(0));
+                                let (conn_shutdown_tx, conn_shutdown_rx) = watch::channel(false);
+                                {
+                                    let mut tr = tracker_tcp.write().await;
+                                    tr.insert(stream_id, ConnInfo {
+                                        peer_ip:      peer.to_string(),
+                                        db_id,
+                                        tunnel_id,
+                                        connected_at: Instant::now(),
+                                        bytes_in:     Arc::clone(&bytes_in),
+                                        bytes_out:    Arc::clone(&bytes_out),
+                                        shutdown_tx:  conn_shutdown_tx,
+                                    });
+                                }
+
                                 let _ = write_tx_tcp.send(Frame::Control(Message::NewConnection { tunnel_id, stream_id, is_udp: false, peer_addr: Some(peer) })).await;
                                 let wtx = write_tx_tcp.clone(); let st = Arc::clone(&state_tcp);
-                                tokio::spawn(async move { handle_player_stream(player_stream, stream_id, player_rx, wtx, st).await; });
+                                let tr = Arc::clone(&tracker_tcp);
+                                tokio::spawn(async move {
+                                    handle_player_stream(player_stream, stream_id, player_rx, wtx, st, bytes_in, bytes_out, conn_shutdown_rx).await;
+                                    // Remove from tracker when the connection closes.
+                                    tr.write().await.remove(&stream_id);
+                                });
                             }
                             Err(e) => { error!("Accept error: {:?}", e); }
                         }}
@@ -536,6 +669,7 @@ async fn handle_control_message(
             info!("Closing tunnel {}", tunnel_id);
             let mut st = state.write().await;
             if let Some(t) = st.tunnels.remove(&tunnel_id) { let _ = t.shutdown_tx.send(true); }
+            st.tunnel_db_id.remove(&tunnel_id);
             let sids: Vec<u64> = st.stream_tunnel.iter().filter(|(_, &tid)| tid == tunnel_id).map(|(&sid, _)| sid).collect();
             for sid in &sids { st.streams.remove(sid); st.udp_peers.remove(sid); st.stream_tunnel.remove(sid); let _ = write_tx.send(Frame::StreamClose { stream_id: *sid }).await; }
             if !sids.is_empty() { info!("Closed {} connections for tunnel {}", sids.len(), tunnel_id); }
@@ -551,23 +685,38 @@ async fn handle_player_stream(
     mut from_tunnel: mpsc::Receiver<Vec<u8>>,
     to_tunnel: mpsc::Sender<Frame>,
     state: Arc<RwLock<ServerState>>,
+    bytes_in: Arc<AtomicU64>,
+    bytes_out: Arc<AtomicU64>,
+    mut shutdown: watch::Receiver<bool>,
 ) {
     let (mut pr, mut pw) = player.into_split();
     let to_tunnel_r = to_tunnel.clone();
+    let bytes_in_r = Arc::clone(&bytes_in);
     let read_task = tokio::spawn(async move {
         let mut buf = vec![0u8; 65536];
         loop {
             match pr.read(&mut buf).await {
                 Ok(0) => break,
-                Ok(n) => { if to_tunnel_r.send(Frame::Data { stream_id, payload: buf[..n].to_vec() }).await.is_err() { break; } }
+                Ok(n) => {
+                    bytes_in_r.fetch_add(n as u64, Ordering::Relaxed);
+                    if to_tunnel_r.send(Frame::Data { stream_id, payload: buf[..n].to_vec() }).await.is_err() { break; }
+                }
                 Err(_) => break,
             }
         }
     });
     let write_task = tokio::spawn(async move {
-        while let Some(data) = from_tunnel.recv().await { if pw.write_all(&data).await.is_err() { break; } }
+        while let Some(data) = from_tunnel.recv().await {
+            bytes_out.fetch_add(data.len() as u64, Ordering::Relaxed);
+            if pw.write_all(&data).await.is_err() { break; }
+        }
     });
-    tokio::select! { _ = read_task => {} _ = write_task => {} }
+    tokio::select! {
+        _ = read_task  => {}
+        _ = write_task => {}
+        // Forced disconnect via DELETE /api/connections/{stream_id}.
+        _ = shutdown.changed() => { info!("Force-disconnecting player stream {}", stream_id); }
+    }
     let _ = to_tunnel.send(Frame::StreamClose { stream_id }).await;
     let mut st = state.write().await;
     st.streams.remove(&stream_id); st.stream_tunnel.remove(&stream_id);
