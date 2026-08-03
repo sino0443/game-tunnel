@@ -455,20 +455,17 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "axum",
- "chrono",
  "game-tunnel-shared",
  "reqwest",
  "rustls-pemfile",
  "serde",
  "serde_json",
  "socket2 0.5.10",
- "sqlx",
  "tokio",
  "tokio-rustls",
  "toml",
  "tracing",
  "tracing-subscriber",
- "uuid",
 ]
 
 [[package]]
