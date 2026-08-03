@@ -432,7 +432,7 @@ async fn handle_control_message(
                                 debug!("Player {} connected (stream {} TCP)", peer, stream_id);
                                 let (player_tx, player_rx) = mpsc::channel::<Vec<u8>>(2048);
                                 { let mut st = state_tcp.write().await; st.streams.insert(stream_id, PlayerStream { tx: player_tx }); st.stream_tunnel.insert(stream_id, tunnel_id); }
-                                let _ = write_tx_tcp.send(Frame::Control(Message::NewConnection { tunnel_id, stream_id, is_udp: false })).await;
+                                let _ = write_tx_tcp.send(Frame::Control(Message::NewConnection { tunnel_id, stream_id, is_udp: false, peer_addr: Some(peer) })).await;
                                 let wtx = write_tx_tcp.clone(); let st = Arc::clone(&state_tcp);
                                 tokio::spawn(async move { handle_player_stream(player_stream, stream_id, player_rx, wtx, st).await; });
                             }
@@ -498,7 +498,7 @@ async fn handle_control_message(
                                         let sid = STREAM_ID_COUNTER.fetch_add(1, Ordering::Relaxed);
                                         peer_streams.insert(peer_addr, sid);
                                         { let mut st = state_udp.write().await; st.udp_peers.insert(sid, UdpPeer { addr: peer_addr, socket: Arc::clone(&socket) }); st.stream_tunnel.insert(sid, tunnel_id); }
-                                        let _ = write_tx_udp.send(Frame::Control(Message::NewConnection { tunnel_id, stream_id: sid, is_udp: true })).await;
+                                        let _ = write_tx_udp.send(Frame::Control(Message::NewConnection { tunnel_id, stream_id: sid, is_udp: true, peer_addr: Some(peer_addr) })).await;
                                         sid
                                     }
                                 };

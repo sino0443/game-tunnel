@@ -30,6 +30,10 @@ pub struct DbTunnel {
     pub server_ip: String, pub server_port: u16, pub remote_port: u16,
     pub protocol: String, pub server_id: Option<u32>,
     pub subdomain: String, pub domain: String,
+    /// When true the client prepends a PROXY Protocol v1 header to every new
+    /// TCP connection so that the backend server (e.g. Velocity) receives the
+    /// real player IP instead of the tunnel's loopback address.
+    pub proxy_protocol: bool,
 }
 
 struct ActiveTunnel {
@@ -45,6 +49,8 @@ struct ClientState {
     tunnels: HashMap<u32, ActiveTunnel>,
     tunnel_local_addrs: HashMap<u32, String>,
     tunnel_protocols: HashMap<u32, String>,
+    /// Tracks which tunnel_ids have Proxy Protocol v1 enabled.
+    tunnel_proxy_protocol: HashMap<u32, bool>,
     streams: HashMap<u64, LocalStream>,
     stream_tunnel: HashMap<u64, u32>,
     tunnel_server: HashMap<u32, u32>,
@@ -236,6 +242,10 @@ struct ManagerTunnelEntry {
     server_id: Option<u32>,
     subdomain: String,
     domain: String,
+    /// Proxy Protocol v1 enabled for this tunnel.
+    /// Defaults to false when talking to an older manager that doesn't send it.
+    #[serde(default)]
+    proxy_protocol: bool,
 }
 
 /// Fetches the list of tunnels assigned to this client from the manager API.
@@ -271,17 +281,18 @@ async fn query_tunnels_from_manager(
     Ok(entries
         .into_iter()
         .map(|e| DbTunnel {
-            id:          e.id,
-            uuid:        e.uuid,
-            name:        e.name,
-            online:      true, // manager only returns online tunnels
-            server_ip:   e.server_ip,
-            server_port: e.server_port,
-            remote_port: e.remote_port,
-            protocol:    e.protocol,
-            server_id:   e.server_id,
-            subdomain:   e.subdomain,
-            domain:      e.domain,
+            id:             e.id,
+            uuid:           e.uuid,
+            name:           e.name,
+            online:         true, // manager only returns online tunnels
+            server_ip:      e.server_ip,
+            server_port:    e.server_port,
+            remote_port:    e.remote_port,
+            protocol:       e.protocol,
+            server_id:      e.server_id,
+            subdomain:      e.subdomain,
+            domain:         e.domain,
+            proxy_protocol: e.proxy_protocol,
         })
         .collect())
 }
@@ -423,6 +434,7 @@ async fn run_server_task(
                         if let Some(t) = st.tunnels.remove(db_id) {
                             st.tunnel_local_addrs.remove(&t.tunnel_id);
                             st.tunnel_protocols.remove(&t.tunnel_id);
+                            st.tunnel_proxy_protocol.remove(&t.tunnel_id);
                             st.tunnel_server.remove(&t.tunnel_id);
                         }
                         stats.remove_tunnel(*tunnel_id).await;
@@ -473,8 +485,9 @@ async fn run_client(config: ClientConfig) -> Result<()> {
 
     let state = Arc::new(RwLock::new(ClientState {
         tunnels: HashMap::new(), tunnel_local_addrs: HashMap::new(),
-        tunnel_protocols: HashMap::new(), streams: HashMap::new(),
-        stream_tunnel: HashMap::new(), tunnel_server: HashMap::new(),
+        tunnel_protocols: HashMap::new(), tunnel_proxy_protocol: HashMap::new(),
+        streams: HashMap::new(), stream_tunnel: HashMap::new(),
+        tunnel_server: HashMap::new(),
     }));
 
     let servers: Arc<RwLock<HashMap<u32, ServerConnection>>> =
@@ -703,6 +716,7 @@ async fn sync_tunnels(
             if let Some(t) = st.tunnels.remove(db_id) {
                 st.tunnel_local_addrs.remove(&t.tunnel_id);
                 st.tunnel_server.remove(&t.tunnel_id);
+                st.tunnel_proxy_protocol.remove(&t.tunnel_id);
             }
             stats.remove_tunnel(tunnel_id).await;
             // Report "stopped" to manager so it updates the DB.
@@ -736,6 +750,7 @@ async fn sync_tunnels(
                 st.tunnel_local_addrs.remove(&t.tunnel_id);
                 st.tunnel_server.remove(&t.tunnel_id);
                 st.tunnel_protocols.remove(&t.tunnel_id);
+                st.tunnel_proxy_protocol.remove(&t.tunnel_id);
             }
         }
         stats.remove_tunnel(tunnel_id).await;
@@ -766,6 +781,7 @@ async fn sync_tunnels(
             });
             st.tunnel_local_addrs.insert(new_tid, local_addr);
             st.tunnel_protocols.insert(new_tid, dbt.protocol.clone());
+            st.tunnel_proxy_protocol.insert(new_tid, dbt.proxy_protocol);
             st.tunnel_server.insert(new_tid, *new_sid);
         }
         stats.add_tunnel(new_tid, dbt.id, dbt.name.clone(), dbt.subdomain.clone()).await;
@@ -821,11 +837,56 @@ async fn sync_tunnels(
             });
             st.tunnel_local_addrs.insert(tunnel_id, local_address);
             st.tunnel_protocols.insert(tunnel_id, dbt.protocol.clone());
+            st.tunnel_proxy_protocol.insert(tunnel_id, dbt.proxy_protocol);
             st.tunnel_server.insert(tunnel_id, server_id);
         }
         stats.add_tunnel(tunnel_id, dbt.id, dbt.name.clone(), dbt.subdomain.clone()).await;
     }
     Ok(())
+}
+
+/// Builds a Proxy Protocol v1 header string for the given peer address and
+/// local game server address.
+///
+/// Format: `PROXY TCP4 <src_ip> <dst_ip> <src_port> <dst_port>\r\n`
+///
+/// Velocity and HAProxy use this to determine the real client IP.  Falls back
+/// to `PROXY UNKNOWN\r\n` when the peer address is not available (old server
+/// that doesn't send it) or the addresses cannot be parsed.
+fn build_proxy_protocol_header(
+    peer_addr: Option<std::net::SocketAddr>,
+    local_addr: &str,
+) -> String {
+    let Some(peer) = peer_addr else {
+        return "PROXY UNKNOWN\r\n".to_string();
+    };
+
+    // Parse the local game server address to extract host and port.
+    let dst_port = local_addr
+        .rsplit(':')
+        .next()
+        .and_then(|p| p.parse::<u16>().ok())
+        .unwrap_or(25565);
+    let dst_ip = local_addr
+        .rsplitn(2, ':')
+        .nth(1)
+        .unwrap_or("127.0.0.1")
+        .trim_start_matches('[')
+        .trim_end_matches(']');
+
+    let (proto, src_ip_str, dst_ip_str) = match peer {
+        std::net::SocketAddr::V4(v4) => {
+            ("TCP4", v4.ip().to_string(), dst_ip.to_string())
+        }
+        std::net::SocketAddr::V6(v6) => {
+            ("TCP6", v6.ip().to_string(), dst_ip.to_string())
+        }
+    };
+
+    format!(
+        "PROXY {} {} {} {} {}\r\n",
+        proto, src_ip_str, dst_ip_str, peer.port(), dst_port
+    )
 }
 
 async fn handle_server_frame(
@@ -890,11 +951,14 @@ async fn handle_control_message(
                 info!("Tunnel {} opened on server {} -> {}", tunnel_id, server_id, addr);
             }
         }
-        Message::NewConnection { tunnel_id, stream_id, is_udp } => {
-            let local_addr = {
-                state.read().await.tunnel_local_addrs.get(&tunnel_id)
+        Message::NewConnection { tunnel_id, stream_id, is_udp, peer_addr } => {
+            let (local_addr, use_proxy_protocol) = {
+                let st = state.read().await;
+                let addr = st.tunnel_local_addrs.get(&tunnel_id)
                     .cloned()
-                    .unwrap_or_else(|| "127.0.0.1:25565".into())
+                    .unwrap_or_else(|| "127.0.0.1:25565".into());
+                let pp = *st.tunnel_proxy_protocol.get(&tunnel_id).unwrap_or(&false);
+                (addr, pp)
             };
             stats.total_connections.fetch_add(1, Ordering::Relaxed);
             {
@@ -947,9 +1011,32 @@ async fn handle_control_message(
                 { state_clone.write().await.streams.insert(stream_id, LocalStream { tx }); }
                 tokio::spawn(async move {
                     match TcpStream::connect(&local_addr).await {
-                        Ok(s) => {
+                        Ok(mut s) => {
                             s.set_nodelay(true).ok();
                             apply_socket_options(&s);
+
+                            // Proxy Protocol v1: prepend the PROXY header so that the
+                            // backend (e.g. Velocity) sees the real player IP/port instead
+                            // of the loopback address.
+                            //
+                            // Format: "PROXY TCP4 <src_ip> <dst_ip> <src_port> <dst_port>\r\n"
+                            // We parse the local_addr to extract the server's IP and port.
+                            if use_proxy_protocol {
+                                let header = build_proxy_protocol_header(peer_addr, &local_addr);
+                                if let Err(e) = s.write_all(header.as_bytes()).await {
+                                    error!(
+                                        "Proxy Protocol header write failed (stream {}): {:?}",
+                                        stream_id, e
+                                    );
+                                    // Fall through — the connection will fail gracefully.
+                                } else {
+                                    info!(
+                                        "Proxy Protocol header sent for stream {} (peer={:?})",
+                                        stream_id, peer_addr
+                                    );
+                                }
+                            }
+
                             handle_local_stream(s, stream_id, tunnel_id, server_id, rx, state_clone, servers_clone, stats_clone).await;
                         }
                         Err(e) => {

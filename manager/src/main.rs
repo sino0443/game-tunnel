@@ -776,6 +776,9 @@ struct ClientTunnelEntry {
     server_id: Option<u32>,
     subdomain: String,
     domain: String,
+    /// When true the client must send a PROXY Protocol v1 header before game data
+    /// so the backend (e.g. Velocity) sees the real player IP.
+    proxy_protocol: bool,
 }
 
 /// `GET /api/client/{client_id}/tunnels`
@@ -790,16 +793,17 @@ async fn list_client_tunnels(
     match database::get_tunnels_for_client(&state.db, &client_id).await {
         Ok(rows) => {
             let entries: Vec<ClientTunnelEntry> = rows.into_iter().map(|t| ClientTunnelEntry {
-                id:          t.id,
-                uuid:        t.uuid,
-                name:        t.name,
-                server_ip:   t.server_ip,
-                server_port: t.server_port,
-                remote_port: t.remote_port,
-                protocol:    t.protocol,
-                server_id:   t.server_id,
-                subdomain:   t.subdomain,
-                domain:      t.domain,
+                id:             t.id,
+                uuid:           t.uuid,
+                name:           t.name,
+                server_ip:      t.server_ip,
+                server_port:    t.server_port,
+                remote_port:    t.remote_port,
+                protocol:       t.protocol,
+                server_id:      t.server_id,
+                subdomain:      t.subdomain,
+                domain:         t.domain,
+                proxy_protocol: t.proxy_protocol,
             }).collect();
             Json(entries).into_response()
         }
