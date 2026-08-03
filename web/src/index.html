@@ -472,6 +472,10 @@ tbody tr:hover{background:rgba(255,255,255,.025)}
         <input type="checkbox" id="f-srv" checked>
         <label for="f-srv">SRV Record erstellen (_minecraft._tcp)</label>
       </div>
+      <div class="fcheck">
+        <input type="checkbox" id="f-proxy">
+        <label for="f-proxy">Proxy Protocol aktivieren (Velocity / BungeeCord)</label>
+      </div>
     </div>
     <div class="mfoot">
       <button class="btn btn-g" onclick="closeModal()">Abbrechen</button>
@@ -871,6 +875,7 @@ function showCreate(){
   document.getElementById('f-sid').value='';
   document.getElementById('f-cid').value='';
   document.getElementById('f-srv').checked=true;
+  document.getElementById('f-proxy').checked=false;
   document.getElementById('modal').classList.add('open');
 }
 async function editT(id){
@@ -888,6 +893,7 @@ async function editT(id){
   document.getElementById('f-sid').value=t.server_id||'';
   document.getElementById('f-cid').value=t.client_id||'';
   document.getElementById('f-srv').checked=t.create_srv!==false;
+  document.getElementById('f-proxy').checked=t.proxy_protocol===true;
   document.getElementById('modal').classList.add('open');
 }
 function closeModal(){document.getElementById('modal').classList.remove('open');}
@@ -911,6 +917,7 @@ async function save(){
     server_id: id ? (sid ? +sid : -1) : (sid ? +sid : null),
     client_id: id ? (cid || '-') : (cid || null),
     create_srv:document.getElementById('f-srv').checked,
+    proxy_protocol:document.getElementById('f-proxy').checked,
   };
   const resp=await fetch(id?API+'/api/tunnels/'+id:API+'/api/tunnels',
     {method:id?'PUT':'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(data)});

@@ -49,7 +49,11 @@ pub enum Message {
     CloseTunnel { tunnel_id: u32 },
     /// Server notifies client of a new incoming connection (stream allocated).
     /// is_udp differenziert TCP- von UDP-Verbindungen bei "both"-Tunneln.
-    NewConnection { tunnel_id: u32, stream_id: u64, is_udp: bool },
+    ///
+    /// peer_addr carries the real player IP:port so the client can prepend a
+    /// Proxy Protocol v1 header when the tunnel has proxy_protocol enabled.
+    /// It is optional (None for old servers) to preserve backward compatibility.
+    NewConnection { tunnel_id: u32, stream_id: u64, is_udp: bool, peer_addr: Option<std::net::SocketAddr> },
     /// Heartbeat ping.
     Ping,
     /// Heartbeat pong.
@@ -126,12 +130,31 @@ impl Message {
             Message::CloseTunnel { tunnel_id } => {
                 (MSG_CLOSE_TUNNEL, tunnel_id.to_be_bytes().to_vec())
             }
-            Message::NewConnection { tunnel_id, stream_id, is_udp } => {
-                // Wire format: tunnel_id(4) + stream_id(8) + is_udp(1) = 13 bytes
-                let mut buf = Vec::with_capacity(13);
+            Message::NewConnection { tunnel_id, stream_id, is_udp, peer_addr } => {
+                // Wire format (v1, backward-compatible):
+                //   tunnel_id(4) + stream_id(8) + is_udp(1)          = 13 bytes  (base)
+                //   peer_port(2) + ip_type(1) + ip_bytes(4 or 16)    = 7 or 19   (optional)
+                //
+                // ip_type: 4 = IPv4 (4 bytes), 6 = IPv6 (16 bytes).
+                // Old servers that don't send a peer_addr simply produce 13 bytes;
+                // new clients ignore the missing trailing data and set peer_addr = None.
+                let mut buf = Vec::with_capacity(32);
                 buf.extend_from_slice(&tunnel_id.to_be_bytes());
                 buf.extend_from_slice(&stream_id.to_be_bytes());
                 buf.push(*is_udp as u8);
+                match peer_addr {
+                    Some(std::net::SocketAddr::V4(v4)) => {
+                        buf.extend_from_slice(&v4.port().to_be_bytes());
+                        buf.push(4u8);
+                        buf.extend_from_slice(&v4.ip().octets());
+                    }
+                    Some(std::net::SocketAddr::V6(v6)) => {
+                        buf.extend_from_slice(&v6.port().to_be_bytes());
+                        buf.push(6u8);
+                        buf.extend_from_slice(&v6.ip().octets());
+                    }
+                    None => {} // omit — old clients will see 13 bytes and default peer_addr = None
+                }
                 (MSG_NEW_CONNECTION, buf)
             }
             Message::Ping => (MSG_PING, vec![]),
@@ -226,9 +249,36 @@ impl Message {
                 }
                 let tunnel_id = u32::from_be_bytes(payload[0..4].try_into()?);
                 let stream_id = u64::from_be_bytes(payload[4..12].try_into()?);
-                // is_udp ist das 13. Byte — defaultet auf false für ältere Nachrichten.
+                // is_udp is the 13th byte — defaults to false for legacy senders.
                 let is_udp = payload.get(12).map(|&b| b != 0).unwrap_or(false);
-                Ok(Message::NewConnection { tunnel_id, stream_id, is_udp })
+
+                // Optional peer_addr: peer_port(2) + ip_type(1) + ip_bytes(4 or 16)
+                // Only present when the sender is a new server that includes it.
+                let peer_addr = if payload.len() >= 16 {
+                    let port = u16::from_be_bytes(payload[13..15].try_into()?);
+                    let ip_type = payload[15];
+                    match ip_type {
+                        4 if payload.len() >= 20 => {
+                            let octets: [u8; 4] = payload[16..20].try_into()?;
+                            Some(std::net::SocketAddr::new(
+                                std::net::IpAddr::V4(std::net::Ipv4Addr::from(octets)),
+                                port,
+                            ))
+                        }
+                        6 if payload.len() >= 32 => {
+                            let octets: [u8; 16] = payload[16..32].try_into()?;
+                            Some(std::net::SocketAddr::new(
+                                std::net::IpAddr::V6(std::net::Ipv6Addr::from(octets)),
+                                port,
+                            ))
+                        }
+                        _ => None, // unknown type or too short — ignore gracefully
+                    }
+                } else {
+                    None
+                };
+
+                Ok(Message::NewConnection { tunnel_id, stream_id, is_udp, peer_addr })
             }
             MSG_PING => Ok(Message::Ping),
             MSG_PONG => Ok(Message::Pong),

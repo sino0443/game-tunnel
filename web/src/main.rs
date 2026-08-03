@@ -76,11 +76,14 @@ async fn basic_auth_middleware(
 /// startup is idempotent — duplicate-column errors are silently ignored.
 async fn ensure_web_columns(pool: &MySqlPool) -> Result<()> {
     let columns: &[(&str, &str)] = &[
-        ("create_srv",    "BOOLEAN NOT NULL DEFAULT TRUE"),
-        ("client_id",     "VARCHAR(50) DEFAULT NULL"),
-        ("tunnel_status", "VARCHAR(20) NOT NULL DEFAULT 'stopped'"),
-        ("last_seen",     "DATETIME DEFAULT NULL"),
-        ("dns_set",       "BOOLEAN NOT NULL DEFAULT FALSE"),
+        ("create_srv",      "BOOLEAN NOT NULL DEFAULT TRUE"),
+        ("client_id",       "VARCHAR(50) DEFAULT NULL"),
+        ("tunnel_status",   "VARCHAR(20) NOT NULL DEFAULT 'stopped'"),
+        ("last_seen",       "DATETIME DEFAULT NULL"),
+        ("dns_set",         "BOOLEAN NOT NULL DEFAULT FALSE"),
+        // Proxy Protocol v1 support (e.g. for Velocity): when TRUE the client
+        // prepends a "PROXY TCP4 ..." header so the backend sees the real player IP.
+        ("proxy_protocol",  "BOOLEAN NOT NULL DEFAULT FALSE"),
     ];
     for (col, def) in columns {
         let sql = format!("ALTER TABLE tunnels ADD COLUMN {} {}", col, def);
@@ -153,6 +156,9 @@ struct TunnelResponse {
     server_id: Option<u32>, client_id: Option<String>,
     tunnel_status: String, last_seen: Option<String>, created_at: String,
     create_srv: bool,
+    /// Proxy Protocol v1 enabled — client prepends a PROXY header so the
+    /// backend (e.g. Velocity) receives the real player IP.
+    proxy_protocol: bool,
 }
 
 #[derive(Deserialize)]
@@ -163,6 +169,9 @@ struct CreateTunnelRequest {
     client_id: Option<String>,
     #[serde(default = "default_true")]
     create_srv: bool,
+    /// Enable Proxy Protocol v1 for this tunnel (Velocity / BungeeCord).
+    #[serde(default)]
+    proxy_protocol: bool,
 }
 fn default_true() -> bool { true }
 
@@ -173,6 +182,8 @@ struct UpdateTunnelRequest {
     domain: Option<String>, online: Option<bool>, server_id: Option<i32>,
     client_id: Option<String>,
     create_srv: Option<bool>,
+    /// Enable / disable Proxy Protocol v1.
+    proxy_protocol: Option<bool>,
 }
 
 fn row_to_tunnel(r: &sqlx::mysql::MySqlRow) -> TunnelResponse {
@@ -189,6 +200,7 @@ fn row_to_tunnel(r: &sqlx::mysql::MySqlRow) -> TunnelResponse {
         last_seen: r.try_get::<Option<chrono::NaiveDateTime>, _>("last_seen").ok().flatten().map(|d| d.to_string()),
         created_at: r.try_get::<chrono::NaiveDateTime, _>("created_at").map(|d| d.to_string()).unwrap_or_default(),
         create_srv: r.try_get("create_srv").unwrap_or(true),
+        proxy_protocol: r.try_get("proxy_protocol").unwrap_or(false),
     }
 }
 
@@ -233,13 +245,13 @@ async fn create_tunnel(State(state): State<Arc<AppState>>, Json(req): Json<Creat
 
     match sqlx::query(
         "INSERT INTO tunnels \
-         (id, uuid, name, server_ip, server_port, remote_port, protocol, domain, subdomain, server_id, client_id, create_srv, online) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, TRUE)",
+         (id, uuid, name, server_ip, server_port, remote_port, protocol, domain, subdomain, server_id, client_id, create_srv, proxy_protocol, online) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, TRUE)",
     )
     .bind(next_id)
     .bind(&uuid).bind(&name).bind(&req.server_ip).bind(req.server_port).bind(req.remote_port)
     .bind(&protocol).bind(&domain).bind(&req.subdomain).bind(req.server_id).bind(req.client_id)
-    .bind(req.create_srv)
+    .bind(req.create_srv).bind(req.proxy_protocol)
     .execute(&mut *tx).await
     {
         Ok(_) => {
@@ -269,6 +281,7 @@ async fn update_tunnel(State(state): State<Arc<AppState>>, Path(id): Path<u32>, 
     if req.server_id.is_some() { u.push("server_id = ?"); }
     if req.client_id.is_some() { u.push("client_id = ?"); }
     if req.create_srv.is_some() { u.push("create_srv = ?"); }
+    if req.proxy_protocol.is_some() { u.push("proxy_protocol = ?"); }
     if u.is_empty() { return (StatusCode::BAD_REQUEST, "No fields").into_response(); }
 
     // Reset dns_set whenever a field that affects DNS is changed, so the
@@ -294,6 +307,7 @@ async fn update_tunnel(State(state): State<Arc<AppState>>, Path(id): Path<u32>, 
         if v == "-" { q = q.bind(Option::<String>::None); } else { q = q.bind(Some(v.clone())); }
     }
     if let Some(v) = req.create_srv { q = q.bind(v); }
+    if let Some(v) = req.proxy_protocol { q = q.bind(v); }
     q = q.bind(id);
 
     match q.execute(&state.db).await {
