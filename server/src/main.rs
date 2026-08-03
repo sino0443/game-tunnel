@@ -1,10 +1,12 @@
 use anyhow::{Context, Result};
-use axum::extract::State;
-use axum::routing::post;
+use axum::extract::{Path, State};
+use axum::http::StatusCode;
+use axum::response::IntoResponse;
+use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use game_tunnel_shared::config::ServerConfig;
 use game_tunnel_shared::protocol::{self, Frame, Message, TunnelProtocol};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::BufReader;
@@ -43,15 +45,74 @@ const PRE_AUTH_TTL_SECS: u64 = 10;
 /// manager granted the pre-authorization.
 type PreAuthCache = Arc<RwLock<HashMap<String, Instant>>>;
 
+// ── Connection tracking ───────────────────────────────────────────────────────
+
+/// Per-connection record kept in the global registry.
+struct ConnRecord {
+    db_id: u32,
+    tunnel_id: u32,
+    peer_ip: String,
+    bytes_in: Arc<AtomicU64>,
+    bytes_out: Arc<AtomicU64>,
+    /// Computed once per second by `update_connection_rates`.
+    bytes_in_per_sec: Arc<AtomicU64>,
+    /// Computed once per second by `update_connection_rates`.
+    bytes_out_per_sec: Arc<AtomicU64>,
+    connected_at: Instant,
+    /// Sending `true` here terminates the TCP player-stream task immediately.
+    /// For UDP sessions the signal is best-effort — the registry entry is
+    /// removed on `DELETE /api/connections/{stream_id}` regardless.
+    kill_tx: watch::Sender<bool>,
+}
+
+/// Process-wide map of `stream_id → ConnRecord`.
+type ConnRegistry = Arc<RwLock<HashMap<u64, ConnRecord>>>;
+
+/// Combined state for the management HTTP server.
+/// All three management routes share this single state.
+#[derive(Clone)]
+struct MgmtState {
+    pre_auth_cache: PreAuthCache,
+    registry: ConnRegistry,
+}
+
+/// JSON payload returned by `GET /api/connections`.
+/// Field names and types match `ServerConnData` in the manager.
+#[derive(Serialize)]
+struct ConnectionInfo {
+    stream_id: u64,
+    db_id: u32,
+    tunnel_id: u32,
+    peer_ip: String,
+    bytes_in: u64,
+    bytes_out: u64,
+    bytes_in_per_sec: u64,
+    bytes_out_per_sec: u64,
+    connected_secs: u64,
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+
 struct ActiveTunnel {
     #[allow(dead_code)] tunnel_id: u32,
     #[allow(dead_code)] remote_port: u16,
     #[allow(dead_code)] protocol: TunnelProtocol,
+    /// Database row id of this tunnel.  Carried in `OpenTunnel` by the client
+    /// so new player connections can populate `ConnRecord.db_id` without a
+    /// separate database lookup.
+    db_id: u32,
     shutdown_tx: watch::Sender<bool>,
 }
 
 struct PlayerStream { tx: mpsc::Sender<Vec<u8>> }
-struct UdpPeer { addr: std::net::SocketAddr, socket: Arc<UdpSocket> }
+
+struct UdpPeer {
+    addr: std::net::SocketAddr,
+    socket: Arc<UdpSocket>,
+    /// Outbound byte counter; incremented in `handle_client` each time a
+    /// `Frame::Data` is forwarded back to this UDP peer.
+    bytes_out: Arc<AtomicU64>,
+}
 
 struct ServerState {
     tunnels: HashMap<u32, ActiveTunnel>,
@@ -112,21 +173,65 @@ struct PreAuthRequest {
 /// Called by the manager to notify the server that a client with the given
 /// UUID is expected to connect within the next `PRE_AUTH_TTL_SECS` seconds.
 async fn handle_pre_auth_request(
-    State(cache): State<PreAuthCache>,
+    State(state): State<MgmtState>,
     Json(req): Json<PreAuthRequest>,
 ) -> axum::http::StatusCode {
-    let mut c = cache.write().await;
+    let mut c = state.pre_auth_cache.write().await;
     c.insert(req.client_uuid.clone(), Instant::now());
     info!("Pre-auth stored for client UUID {} (TTL: {}s)", req.client_uuid, PRE_AUTH_TTL_SECS);
     axum::http::StatusCode::OK
 }
 
-/// Starts the management HTTP server that listens for pre-auth notifications
-/// from the manager. This runs in a background task.
-async fn start_mgmt_server(bind_addr: String, cache: PreAuthCache) {
+/// Handler for `GET /api/connections`.
+///
+/// Returns all currently active player connections so the manager can
+/// display them in the tunnel-connections UI.  The manager polls this
+/// endpoint once per second from `refresh_stats`.
+async fn handle_get_connections(State(state): State<MgmtState>) -> impl IntoResponse {
+    let reg = state.registry.read().await;
+    let conns: Vec<ConnectionInfo> = reg.iter().map(|(&stream_id, r)| ConnectionInfo {
+        stream_id,
+        db_id:             r.db_id,
+        tunnel_id:         r.tunnel_id,
+        peer_ip:           r.peer_ip.clone(),
+        bytes_in:          r.bytes_in.load(Ordering::Relaxed),
+        bytes_out:         r.bytes_out.load(Ordering::Relaxed),
+        bytes_in_per_sec:  r.bytes_in_per_sec.load(Ordering::Relaxed),
+        bytes_out_per_sec: r.bytes_out_per_sec.load(Ordering::Relaxed),
+        connected_secs:    r.connected_at.elapsed().as_secs(),
+    }).collect();
+    Json(conns)
+}
+
+/// Handler for `DELETE /api/connections/{stream_id}`.
+///
+/// Forces a player off the server.  For TCP the stream task is signalled and
+/// exits immediately.  For UDP the registry entry is removed; the underlying
+/// socket session drains naturally via the stale-session timeout path.
+async fn handle_disconnect_connection(
+    State(state): State<MgmtState>,
+    Path(stream_id): Path<u64>,
+) -> impl IntoResponse {
+    let mut reg = state.registry.write().await;
+    match reg.remove(&stream_id) {
+        Some(record) => {
+            // Signal the TCP player-stream task to shut down.  Errors are
+            // ignored because the connection may have already closed on its own.
+            let _ = record.kill_tx.send(true);
+            StatusCode::OK
+        }
+        None => StatusCode::NOT_FOUND,
+    }
+}
+
+/// Starts the management HTTP server that the manager reaches for pre-auth
+/// and connection-list requests.  Runs as a background task.
+async fn start_mgmt_server(bind_addr: String, state: MgmtState) {
     let app = Router::new()
-        .route("/api/manager/pre-auth", post(handle_pre_auth_request))
-        .with_state(cache);
+        .route("/api/manager/pre-auth",           post(handle_pre_auth_request))
+        .route("/api/connections",                 get(handle_get_connections))
+        .route("/api/connections/{stream_id}",     delete(handle_disconnect_connection))
+        .with_state(state);
 
     info!("Server management API listening on {}", bind_addr);
     match tokio::net::TcpListener::bind(&bind_addr).await {
@@ -156,6 +261,32 @@ async fn cleanup_pre_auth_cache(cache: PreAuthCache) {
     }
 }
 
+/// Background task: updates per-second bandwidth rates for all tracked connections.
+///
+/// Runs every second, computes the delta of `bytes_in`/`bytes_out` since the
+/// previous tick, and stores the result in the `*_per_sec` atomics.  Using
+/// separate atomic counters avoids taking a write lock on every received packet.
+async fn update_connection_rates(registry: ConnRegistry) {
+    let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(1));
+    // Previous snapshot: stream_id → (prev_bytes_in, prev_bytes_out)
+    let mut prev: HashMap<u64, (u64, u64)> = HashMap::new();
+    loop {
+        interval.tick().await;
+        let reg = registry.read().await;
+        for (&sid, r) in reg.iter() {
+            let cur_in  = r.bytes_in.load(Ordering::Relaxed);
+            let cur_out = r.bytes_out.load(Ordering::Relaxed);
+            let (p_in, p_out) = prev.entry(sid).or_insert((cur_in, cur_out));
+            r.bytes_in_per_sec.store(cur_in.saturating_sub(*p_in),    Ordering::Relaxed);
+            r.bytes_out_per_sec.store(cur_out.saturating_sub(*p_out), Ordering::Relaxed);
+            *p_in  = cur_in;
+            *p_out = cur_out;
+        }
+        // Purge entries for connections that have since closed.
+        prev.retain(|sid, _| reg.contains_key(sid));
+    }
+}
+
 // ── Main ─────────────────────────────────────────────────────────────────────
 
 #[tokio::main]
@@ -174,14 +305,26 @@ async fn main() -> Result<()> {
     // Shared pre-auth cache: populated by manager, consumed on client connect.
     let pre_auth_cache: PreAuthCache = Arc::new(RwLock::new(HashMap::new()));
 
-    // Start management HTTP server so manager can push pre-auth entries.
-    let mgmt_cache = Arc::clone(&pre_auth_cache);
+    // Global connection registry: every active player stream registers here so
+    // the management API can expose the list to the manager.
+    let registry: ConnRegistry = Arc::new(RwLock::new(HashMap::new()));
+
+    // Start management HTTP server so the manager can push pre-auth entries
+    // and poll active connections.
+    let mgmt_state = MgmtState {
+        pre_auth_cache: Arc::clone(&pre_auth_cache),
+        registry: Arc::clone(&registry),
+    };
     let mgmt_addr = config.mgmt_bind_address.clone();
-    tokio::spawn(start_mgmt_server(mgmt_addr, mgmt_cache));
+    tokio::spawn(start_mgmt_server(mgmt_addr, mgmt_state));
 
     // Periodically remove expired cache entries.
     let cleanup_cache = Arc::clone(&pre_auth_cache);
     tokio::spawn(cleanup_pre_auth_cache(cleanup_cache));
+
+    // Periodically compute per-second bandwidth rates.
+    let registry_rate = Arc::clone(&registry);
+    tokio::spawn(update_connection_rates(registry_rate));
 
     info!("Starting game-tunnel server {} on {}", config.server_id, config.bind_address);
     let listener = TcpListener::bind(&config.bind_address).await
@@ -202,16 +345,17 @@ async fn main() -> Result<()> {
         }
 
         info!("Client connection from {} (TLS handshake...)", addr);
-        let acceptor = tls_acceptor.clone();
-        let config = config.clone();
+        let acceptor    = tls_acceptor.clone();
+        let config      = config.clone();
         let public_bind = public_bind.clone();
-        let cache = Arc::clone(&pre_auth_cache);
+        let cache       = Arc::clone(&pre_auth_cache);
+        let reg         = Arc::clone(&registry);
 
         tokio::spawn(async move {
             match acceptor.accept(tcp_stream).await {
                 Ok(tls_stream) => {
                     info!("Client {} TLS handshake complete", addr);
-                    if let Err(e) = handle_client(tls_stream, addr, &config, &public_bind, cache).await {
+                    if let Err(e) = handle_client(tls_stream, addr, &config, &public_bind, cache, reg).await {
                         let msg = e.to_string();
                         if msg.contains("close_notify") || msg.contains("peer closed") || msg.contains("idle timeout") {
                             // Expected disconnects – silent.
@@ -262,6 +406,7 @@ async fn handle_client(
     config: &ServerConfig,
     public_bind: &str,
     pre_auth_cache: PreAuthCache,
+    registry: ConnRegistry,
 ) -> Result<()> {
     let (mut read_half, mut write_half) = tokio::io::split(stream);
 
@@ -352,9 +497,10 @@ async fn handle_client(
         }
     });
 
-    let state_clone = Arc::clone(&state);
+    let state_clone    = Arc::clone(&state);
     let write_tx_clone = write_tx.clone();
-    let idle_timeout = tokio::time::Duration::from_secs(CLIENT_IDLE_TIMEOUT_SECS);
+    let registry_loop  = Arc::clone(&registry);
+    let idle_timeout   = tokio::time::Duration::from_secs(CLIENT_IDLE_TIMEOUT_SECS);
 
     let result: Result<()> = async {
         loop {
@@ -364,7 +510,9 @@ async fn handle_client(
                 Err(_) => { warn!("Client {} idle timeout", addr); anyhow::bail!("idle timeout"); }
             };
             match frame {
-                Frame::Control(msg) => { handle_control_message(msg, addr, &state_clone, &write_tx_clone).await?; }
+                Frame::Control(msg) => {
+                    handle_control_message(msg, addr, &state_clone, &write_tx_clone, &registry_loop).await?;
+                }
                 Frame::Data { stream_id, payload } => {
                     let tcp_tx = { state_clone.read().await.streams.get(&stream_id).map(|s| s.tx.clone()) };
                     if let Some(tx) = tcp_tx {
@@ -374,8 +522,15 @@ async fn handle_client(
                             st.streams.remove(&stream_id); st.stream_tunnel.remove(&stream_id);
                         }
                     } else {
-                        let peer = { state_clone.read().await.udp_peers.get(&stream_id).map(|p| (p.addr, Arc::clone(&p.socket))) };
-                        if let Some((peer_addr, socket)) = peer { let _ = socket.send_to(&payload, peer_addr).await; }
+                        // UDP path: look up the peer, update outbound byte counter, forward.
+                        let peer = {
+                            state_clone.read().await.udp_peers.get(&stream_id)
+                                .map(|p| (p.addr, Arc::clone(&p.socket), Arc::clone(&p.bytes_out)))
+                        };
+                        if let Some((peer_addr, socket, bytes_out)) = peer {
+                            bytes_out.fetch_add(payload.len() as u64, Ordering::Relaxed);
+                            let _ = socket.send_to(&payload, peer_addr).await;
+                        }
                     }
                 }
                 Frame::StreamClose { stream_id } => {
@@ -394,9 +549,10 @@ async fn handle_client(
 async fn handle_control_message(
     msg: Message, client_addr: SocketAddr,
     state: &Arc<RwLock<ServerState>>, write_tx: &mpsc::Sender<Frame>,
+    registry: &ConnRegistry,
 ) -> Result<()> {
     match msg {
-        Message::OpenTunnel { tunnel_id, remote_port, protocol, db_id: _ } => {
+        Message::OpenTunnel { tunnel_id, remote_port, protocol, db_id } => {
             if !is_valid_game_port(remote_port) {
                 warn!("Invalid port {} from {}", remote_port, client_addr);
                 let _ = write_tx.send(Frame::Control(Message::CloseTunnel { tunnel_id })).await;
@@ -419,8 +575,9 @@ async fn handle_control_message(
                     }
                 };
                 info!("Listening on {} (TCP)", addr_str);
-                let state_tcp = Arc::clone(state);
+                let state_tcp    = Arc::clone(state);
                 let write_tx_tcp = write_tx.clone();
+                let registry_tcp = Arc::clone(registry);
                 let mut shutdown = shutdown_rx.clone();
                 tokio::spawn(async move {
                     loop { tokio::select! {
@@ -433,8 +590,36 @@ async fn handle_control_message(
                                 let (player_tx, player_rx) = mpsc::channel::<Vec<u8>>(2048);
                                 { let mut st = state_tcp.write().await; st.streams.insert(stream_id, PlayerStream { tx: player_tx }); st.stream_tunnel.insert(stream_id, tunnel_id); }
                                 let _ = write_tx_tcp.send(Frame::Control(Message::NewConnection { tunnel_id, stream_id, is_udp: false, peer_addr: Some(peer) })).await;
-                                let wtx = write_tx_tcp.clone(); let st = Arc::clone(&state_tcp);
-                                tokio::spawn(async move { handle_player_stream(player_stream, stream_id, player_rx, wtx, st).await; });
+
+                                // Register this connection in the global registry so the
+                                // manager can see it via GET /api/connections.
+                                let db_id_val = state_tcp.read().await.tunnels.get(&tunnel_id).map(|t| t.db_id).unwrap_or(0);
+                                let bytes_in     = Arc::new(AtomicU64::new(0));
+                                let bytes_out    = Arc::new(AtomicU64::new(0));
+                                let bytes_in_ps  = Arc::new(AtomicU64::new(0));
+                                let bytes_out_ps = Arc::new(AtomicU64::new(0));
+                                let (kill_tx, kill_rx) = watch::channel(false);
+                                registry_tcp.write().await.insert(stream_id, ConnRecord {
+                                    db_id:             db_id_val,
+                                    tunnel_id,
+                                    peer_ip:           peer.ip().to_string(),
+                                    bytes_in:          Arc::clone(&bytes_in),
+                                    bytes_out:         Arc::clone(&bytes_out),
+                                    bytes_in_per_sec:  Arc::clone(&bytes_in_ps),
+                                    bytes_out_per_sec: Arc::clone(&bytes_out_ps),
+                                    connected_at:      Instant::now(),
+                                    kill_tx,
+                                });
+
+                                let wtx = write_tx_tcp.clone();
+                                let st  = Arc::clone(&state_tcp);
+                                let reg = Arc::clone(&registry_tcp);
+                                tokio::spawn(async move {
+                                    handle_player_stream(
+                                        player_stream, stream_id, player_rx, wtx, st,
+                                        bytes_in, bytes_out, kill_rx, reg,
+                                    ).await;
+                                });
                             }
                             Err(e) => { error!("Accept error: {:?}", e); }
                         }}
@@ -455,12 +640,17 @@ async fn handle_control_message(
                 };
                 info!("Listening on {} (UDP)", addr_str);
                 let write_tx_udp = write_tx.clone();
-                let state_udp = Arc::clone(state);
+                let state_udp    = Arc::clone(state);
+                let registry_udp = Arc::clone(registry);
                 let mut shutdown = shutdown_rx.clone();
                 tokio::spawn(async move {
                     let mut buf = vec![0u8; 65535];
                     let mut peer_streams: HashMap<std::net::SocketAddr, u64> = HashMap::new();
                     let mut last_seen: HashMap<std::net::SocketAddr, std::time::Instant> = HashMap::new();
+                    // Per-stream inbound byte counters (updated inline on each recv).
+                    let mut peer_bytes_in:  HashMap<u64, Arc<AtomicU64>> = HashMap::new();
+                    // Keep bytes_out arcs here so we can rebind the UdpPeer on NAT port-change.
+                    let mut peer_bytes_out: HashMap<u64, Arc<AtomicU64>> = HashMap::new();
                     let mut cleanup_interval = tokio::time::interval(tokio::time::Duration::from_secs(10));
                     loop { tokio::select! {
                         res = socket.recv_from(&mut buf) => { match res {
@@ -486,10 +676,15 @@ async fn handle_control_message(
                                         peer_streams.insert(peer_addr, existing_sid);
                                         last_seen.insert(peer_addr, std::time::Instant::now());
                                         // Update the stored peer address so responses go to new port.
+                                        let existing_bytes_out = peer_bytes_out.get(&existing_sid)
+                                            .cloned()
+                                            .unwrap_or_else(|| Arc::new(AtomicU64::new(0)));
                                         {
                                             let mut st = state_udp.write().await;
                                             st.udp_peers.insert(existing_sid, UdpPeer {
-                                                addr: peer_addr, socket: Arc::clone(&socket),
+                                                addr: peer_addr,
+                                                socket: Arc::clone(&socket),
+                                                bytes_out: existing_bytes_out,
                                             });
                                         }
                                         existing_sid
@@ -497,11 +692,41 @@ async fn handle_control_message(
                                         // Genuinely new player connection.
                                         let sid = STREAM_ID_COUNTER.fetch_add(1, Ordering::Relaxed);
                                         peer_streams.insert(peer_addr, sid);
-                                        { let mut st = state_udp.write().await; st.udp_peers.insert(sid, UdpPeer { addr: peer_addr, socket: Arc::clone(&socket) }); st.stream_tunnel.insert(sid, tunnel_id); }
+                                        let bytes_in     = Arc::new(AtomicU64::new(0));
+                                        let bytes_out    = Arc::new(AtomicU64::new(0));
+                                        let bytes_in_ps  = Arc::new(AtomicU64::new(0));
+                                        let bytes_out_ps = Arc::new(AtomicU64::new(0));
+                                        peer_bytes_in.insert(sid,  Arc::clone(&bytes_in));
+                                        peer_bytes_out.insert(sid, Arc::clone(&bytes_out));
+                                        let db_id_val = state_udp.read().await.tunnels.get(&tunnel_id).map(|t| t.db_id).unwrap_or(0);
+                                        // kill_rx is not actively watched for UDP (no per-peer task);
+                                        // the kill_tx is still stored so DELETE /api/connections/{sid}
+                                        // can remove the registry entry cleanly.
+                                        let (kill_tx, _kill_rx) = watch::channel(false);
+                                        registry_udp.write().await.insert(sid, ConnRecord {
+                                            db_id:             db_id_val,
+                                            tunnel_id,
+                                            peer_ip:           peer_addr.ip().to_string(),
+                                            bytes_in:          Arc::clone(&bytes_in),
+                                            bytes_out:         Arc::clone(&bytes_out),
+                                            bytes_in_per_sec:  Arc::clone(&bytes_in_ps),
+                                            bytes_out_per_sec: Arc::clone(&bytes_out_ps),
+                                            connected_at:      Instant::now(),
+                                            kill_tx,
+                                        });
+                                        {
+                                            let mut st = state_udp.write().await;
+                                            st.udp_peers.insert(sid, UdpPeer { addr: peer_addr, socket: Arc::clone(&socket), bytes_out });
+                                            st.stream_tunnel.insert(sid, tunnel_id);
+                                        }
                                         let _ = write_tx_udp.send(Frame::Control(Message::NewConnection { tunnel_id, stream_id: sid, is_udp: true, peer_addr: Some(peer_addr) })).await;
                                         sid
                                     }
                                 };
+                                // Accumulate inbound bytes for the rate-computation task.
+                                if let Some(b) = peer_bytes_in.get(&stream_id) {
+                                    b.fetch_add(len as u64, Ordering::Relaxed);
+                                }
                                 let _ = write_tx_udp.send(Frame::Data { stream_id, payload: buf[..len].to_vec() }).await;
                             }
                             Err(e) => { error!("UDP recv error: {:?}", e); break; }
@@ -515,30 +740,49 @@ async fn handle_control_message(
                             for addr in stale {
                                 last_seen.remove(&addr);
                                 if let Some(sid) = peer_streams.remove(&addr) {
+                                    peer_bytes_in.remove(&sid);
+                                    peer_bytes_out.remove(&sid);
                                     { let mut st = state_udp.write().await;
                                         st.udp_peers.remove(&sid);
                                         st.stream_tunnel.remove(&sid);
                                     }
+                                    registry_udp.write().await.remove(&sid);
                                     let _ = write_tx_udp.send(Frame::StreamClose { stream_id: sid }).await;
                                     info!("UDP: stale session removed for {} (stream {})", addr, sid);
                                 }
                             }
                         }
-                        _ = shutdown.changed() => { info!("Shutting down port {} (UDP)", remote_port); break; }
+                        _ = shutdown.changed() => {
+                            info!("Shutting down port {} (UDP)", remote_port);
+                            // Clean up registry entries for any sessions still open on this tunnel.
+                            let mut reg = registry_udp.write().await;
+                            for sid in peer_streams.values() { reg.remove(sid); }
+                            break;
+                        }
                     }}
                 });
             }
 
-            { state.write().await.tunnels.insert(tunnel_id, ActiveTunnel { tunnel_id, remote_port, protocol, shutdown_tx }); }
+            { state.write().await.tunnels.insert(tunnel_id, ActiveTunnel { tunnel_id, remote_port, protocol, db_id, shutdown_tx }); }
             write_tx.send(Frame::Control(Message::TunnelOpened { tunnel_id })).await.context("send TunnelOpened")?;
         }
         Message::CloseTunnel { tunnel_id } => {
             info!("Closing tunnel {}", tunnel_id);
-            let mut st = state.write().await;
-            if let Some(t) = st.tunnels.remove(&tunnel_id) { let _ = t.shutdown_tx.send(true); }
-            let sids: Vec<u64> = st.stream_tunnel.iter().filter(|(_, &tid)| tid == tunnel_id).map(|(&sid, _)| sid).collect();
-            for sid in &sids { st.streams.remove(sid); st.udp_peers.remove(sid); st.stream_tunnel.remove(sid); let _ = write_tx.send(Frame::StreamClose { stream_id: *sid }).await; }
-            if !sids.is_empty() { info!("Closed {} connections for tunnel {}", sids.len(), tunnel_id); }
+            let sids = {
+                let mut st = state.write().await;
+                if let Some(t) = st.tunnels.remove(&tunnel_id) { let _ = t.shutdown_tx.send(true); }
+                let sids: Vec<u64> = st.stream_tunnel.iter().filter(|(_, &tid)| tid == tunnel_id).map(|(&sid, _)| sid).collect();
+                for sid in &sids { st.streams.remove(sid); st.udp_peers.remove(sid); st.stream_tunnel.remove(sid); let _ = write_tx.send(Frame::StreamClose { stream_id: *sid }).await; }
+                sids
+            };
+            if !sids.is_empty() {
+                info!("Closed {} connections for tunnel {}", sids.len(), tunnel_id);
+                // Purge registry entries for all streams belonging to this tunnel.
+                // TCP streams will also self-remove when handle_player_stream exits,
+                // so this is an eager cleanup that avoids a brief stale window.
+                let mut reg = registry.write().await;
+                for sid in &sids { reg.remove(sid); }
+            }
         }
         Message::Ping => { let _ = write_tx.try_send(Frame::Control(Message::Pong)); }
         _ => { warn!("Unexpected control message from {}: {:?}", client_addr, msg); }
@@ -551,24 +795,48 @@ async fn handle_player_stream(
     mut from_tunnel: mpsc::Receiver<Vec<u8>>,
     to_tunnel: mpsc::Sender<Frame>,
     state: Arc<RwLock<ServerState>>,
+    bytes_in: Arc<AtomicU64>,
+    bytes_out: Arc<AtomicU64>,
+    mut kill_rx: watch::Receiver<bool>,
+    registry: ConnRegistry,
 ) {
     let (mut pr, mut pw) = player.into_split();
     let to_tunnel_r = to_tunnel.clone();
-    let read_task = tokio::spawn(async move {
+    let bytes_in_c  = Arc::clone(&bytes_in);
+    let mut read_task = tokio::spawn(async move {
         let mut buf = vec![0u8; 65536];
         loop {
             match pr.read(&mut buf).await {
                 Ok(0) => break,
-                Ok(n) => { if to_tunnel_r.send(Frame::Data { stream_id, payload: buf[..n].to_vec() }).await.is_err() { break; } }
+                Ok(n) => {
+                    bytes_in_c.fetch_add(n as u64, Ordering::Relaxed);
+                    if to_tunnel_r.send(Frame::Data { stream_id, payload: buf[..n].to_vec() }).await.is_err() { break; }
+                }
                 Err(_) => break,
             }
         }
     });
-    let write_task = tokio::spawn(async move {
-        while let Some(data) = from_tunnel.recv().await { if pw.write_all(&data).await.is_err() { break; } }
+    let bytes_out_c = Arc::clone(&bytes_out);
+    let mut write_task = tokio::spawn(async move {
+        while let Some(data) = from_tunnel.recv().await {
+            bytes_out_c.fetch_add(data.len() as u64, Ordering::Relaxed);
+            if pw.write_all(&data).await.is_err() { break; }
+        }
     });
-    tokio::select! { _ = read_task => {} _ = write_task => {} }
+    tokio::select! {
+        _ = &mut read_task  => {}
+        _ = &mut write_task => {}
+        _ = kill_rx.changed() => {
+            // Forced disconnect via DELETE /api/connections/{stream_id}.
+            // Abort both I/O tasks so the player socket is closed promptly.
+            read_task.abort();
+            write_task.abort();
+        }
+    }
     let _ = to_tunnel.send(Frame::StreamClose { stream_id }).await;
     let mut st = state.write().await;
-    st.streams.remove(&stream_id); st.stream_tunnel.remove(&stream_id);
+    st.streams.remove(&stream_id);
+    st.stream_tunnel.remove(&stream_id);
+    // Remove from registry (no-op when the disconnect handler already did it).
+    registry.write().await.remove(&stream_id);
 }
