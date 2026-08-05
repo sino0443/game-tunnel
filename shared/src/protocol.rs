@@ -331,8 +331,13 @@ pub async fn read_frame<R: AsyncReadExt + Unpin>(reader: &mut R) -> Result<Frame
     }
 }
 
-/// Write a control message as a frame (stream_id = 0).
-pub async fn write_control<W: AsyncWriteExt + Unpin>(
+/// Write a control message as a frame (stream_id = 0), without flushing.
+/// Callers that write several frames back-to-back (see the server's writer
+/// task) should batch-write with this and call `flush()` once at the end —
+/// flushing after every single frame means one syscall (and one extra TLS
+/// record) per frame, which hurts throughput under many concurrent player
+/// connections without improving latency (nothing is held back on purpose).
+pub async fn write_control_noflush<W: AsyncWriteExt + Unpin>(
     writer: &mut W,
     msg: &Message,
 ) -> Result<()> {
@@ -343,12 +348,22 @@ pub async fn write_control<W: AsyncWriteExt + Unpin>(
     if !payload.is_empty() {
         writer.write_all(&payload).await?;
     }
+    Ok(())
+}
+
+/// Write a control message as a frame (stream_id = 0).
+pub async fn write_control<W: AsyncWriteExt + Unpin>(
+    writer: &mut W,
+    msg: &Message,
+) -> Result<()> {
+    write_control_noflush(writer, msg).await?;
     writer.flush().await?;
     Ok(())
 }
 
-/// Write a data frame for a specific stream.
-pub async fn write_data<W: AsyncWriteExt + Unpin>(
+/// Write a data frame for a specific stream, without flushing (see
+/// `write_control_noflush`).
+pub async fn write_data_noflush<W: AsyncWriteExt + Unpin>(
     writer: &mut W,
     stream_id: u64,
     data: &[u8],
@@ -359,7 +374,27 @@ pub async fn write_data<W: AsyncWriteExt + Unpin>(
     if !data.is_empty() {
         writer.write_all(data).await?;
     }
+    Ok(())
+}
+
+/// Write a data frame for a specific stream.
+pub async fn write_data<W: AsyncWriteExt + Unpin>(
+    writer: &mut W,
+    stream_id: u64,
+    data: &[u8],
+) -> Result<()> {
+    write_data_noflush(writer, stream_id, data).await?;
     writer.flush().await?;
+    Ok(())
+}
+
+/// Write a stream close frame, without flushing (see `write_control_noflush`).
+pub async fn write_stream_close_noflush<W: AsyncWriteExt + Unpin>(
+    writer: &mut W,
+    stream_id: u64,
+) -> Result<()> {
+    writer.write_u32(FRAME_TYPE_STREAM_CLOSE).await?;
+    writer.write_u64(stream_id).await?;
     Ok(())
 }
 
@@ -368,8 +403,7 @@ pub async fn write_stream_close<W: AsyncWriteExt + Unpin>(
     writer: &mut W,
     stream_id: u64,
 ) -> Result<()> {
-    writer.write_u32(FRAME_TYPE_STREAM_CLOSE).await?;
-    writer.write_u64(stream_id).await?;
+    write_stream_close_noflush(writer, stream_id).await?;
     writer.flush().await?;
     Ok(())
 }

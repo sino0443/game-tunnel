@@ -506,6 +506,13 @@ tbody tr:hover{background:rgba(255,255,255,.025)}
 <script>
 'use strict';
 const API='';
+// Escapes user-controlled strings before interpolating into innerHTML.
+// Tunnel/subdomain/client names come straight from the API (ultimately from
+// tunnel-create/update requests), so without this a crafted name is stored
+// XSS against anyone who opens the dashboard.
+function esc(s){
+  return String(s??'').replace(/[\\&<>"']/g, c => ({'\\':'\\\\','&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+}
 let domains=[],servers=[],clients=[],lastStats=null;
 
 // clock
@@ -545,11 +552,11 @@ function fmtUp(s){
 }
 function cName(id){
   if(!id)return '—';
-  const c=clients.find(c=>c.id===id);return c?c.name:id;
+  const c=clients.find(c=>c.id===id);return esc(c?c.name:id);
 }
 function sName(id){
   if(id==null)return 'Auto';
-  const s=servers.find(s=>s.id===id);return s?s.name:'VPS '+id;
+  const s=servers.find(s=>s.id===id);return esc(s?s.name:'VPS '+id);
 }
 function pb(p){
   const cls={tcp:'b-tcp',udp:'b-udp',both:'b-both'}[(p||'tcp').toLowerCase()]||'b-tcp';
@@ -581,7 +588,7 @@ async function loadServers(){
     servers=await(await fetch(API+'/api/servers')).json();
     const s=document.getElementById('f-sid');
     s.innerHTML='<option value="">Auto</option>';
-    servers.forEach(sv=>s.innerHTML+=`<option value="${sv.id}">${sv.name}</option>`);
+    servers.forEach(sv=>s.innerHTML+=`<option value="${sv.id}">${esc(sv.name)}</option>`);
   }catch(_){}
 }
 async function loadCD(){
@@ -590,7 +597,7 @@ async function loadCD(){
     if(Array.isArray(d))clients=d;
     const s=document.getElementById('f-cid'),cur=s.value;
     s.innerHTML='<option value="">Auto (Manager)</option>';
-    clients.forEach(c=>s.innerHTML+=`<option value="${c.id}">${c.name} (${c.id})</option>`);
+    clients.forEach(c=>s.innerHTML+=`<option value="${esc(c.id)}">${esc(c.name)} (${esc(c.id)})</option>`);
     if(cur)s.value=cur;
   }catch(_){}
 }
@@ -635,8 +642,8 @@ function renderDash(s){
   }
   document.getElementById('dash-live').innerHTML=
     `<div class="mgrid">${active.map(t=>`
-      <div class="mc live clickable" onclick="openConnections(${t.id},'${(t.name||t.subdomain).replace(/'/g,'&#39;')}')" title="Klicken für Verbindungsdetails">
-        <div class="mc-h"><span class="dot dot-on"></span><span class="mc-n">${t.name||t.subdomain}</span>${pb(t.protocol)}</div>
+      <div class="mc live clickable" onclick="openConnections(${t.id},'${esc(t.name||t.subdomain)}')" title="Klicken für Verbindungsdetails">
+        <div class="mc-h"><span class="dot dot-on"></span><span class="mc-n">${esc(t.name||t.subdomain)}</span>${pb(t.protocol)}</div>
         <div class="mc-m">
           <div class="mm"><div class="v vd">${fmtS(t.bytes_out_per_sec)}</div><div class="l">Down/s</div></div>
           <div class="mm"><div class="v vu">${fmtS(t.bytes_in_per_sec)}</div><div class="l">Up/s</div></div>
@@ -668,8 +675,8 @@ function renderTunnels(tunnels){
       const sb=t.online?`<span class="badge b-on">● Online</span>`:`<span class="badge b-off">● Offline</span>`;
       h+=`<tr>
         <td style="color:var(--text-muted);font-family:monospace;font-size:11px">#${t.id}</td>
-        <td><strong>${t.name||'—'}</strong></td>
-        <td style="font-size:12px;color:var(--text-muted)">${t.subdomain}.${t.domain}</td>
+        <td><strong>${esc(t.name)||'—'}</strong></td>
+        <td style="font-size:12px;color:var(--text-muted)">${esc(t.subdomain)}.${esc(t.domain)}</td>
         <td style="font-size:11px;color:var(--text-muted);font-family:monospace">${t.server_ip}:${t.server_port}</td>
         <td style="font-family:monospace">${t.remote_port}</td>
         <td style="font-size:12px;color:var(--text-muted)">${sName(t.server_id)}</td>
@@ -680,7 +687,7 @@ function renderTunnels(tunnels){
           ${t.online?`<button class="btn btn-warn btn-xs" onclick="stopT(${t.id})">⏹ Stop</button>`
                     :`<button class="btn btn-ok btn-xs" onclick="startT(${t.id})">▶ Start</button>`}
           <button class="btn btn-g btn-xs" onclick="editT(${t.id})">✏ Edit</button>
-          <button class="btn btn-del btn-xs" onclick="delT(${t.id},'${t.subdomain}')">🗑</button>
+          <button class="btn btn-del btn-xs" onclick="delT(${t.id},'${esc(t.subdomain)}')">🗑</button>
         </td>
       </tr>`;
     });
@@ -736,7 +743,7 @@ function connCard(sv,allT){
       const rows=ct.length
         ?ct.map(t=>`<div class="tun-row">
             ${dotEl(t.online,t.tunnel_status)}
-            <span class="tun-name">${t.name||t.subdomain}</span>
+            <span class="tun-name">${esc(t.name||t.subdomain)}</span>
             <span class="tun-port">:${t.remote_port}</span>
             ${pb(t.protocol)}
             ${t.active_connections>0?`<span class="tun-conns">${t.active_connections}👥</span>`:''}
@@ -762,7 +769,7 @@ function connCard(sv,allT){
     body=`<div style="padding:4px 0">${sv.fb.map(t=>`
       <div class="tun-row" style="padding:8px 0">
         ${dotEl(t.online,t.tunnel_status)}
-        <span class="tun-name">${t.name||t.subdomain}</span>
+        <span class="tun-name">${esc(t.name||t.subdomain)}</span>
         <span class="tun-port">:${t.remote_port}</span>
         ${pb(t.protocol)}
       </div>`).join('')}</div>`;
@@ -773,8 +780,8 @@ function connCard(sv,allT){
     <div class="cc-head">
       <div class="srv-icon ${isOn?'on':'off'}">${isOn?'🖥️':'❌'}</div>
       <div class="srv-info">
-        <div class="srv-name">${sv.name||'Server '+sv.id}</div>
-        <div class="srv-addr">${sv.address||'Adresse nicht konfiguriert'}</div>
+        <div class="srv-name">${esc(sv.name||'Server '+sv.id)}</div>
+        <div class="srv-addr">${esc(sv.address||'Adresse nicht konfiguriert')}</div>
       </div>
       <div class="srv-meta">
         <span class="badge ${isOn?'b-on':'b-off'}">${isOn?'● Online':'● Offline'}</span>
@@ -796,9 +803,9 @@ function renderClients(s){
     const cs=(c.servers||[]).filter(sv=>sv.connected);
     return`<div class="ccard ${c.reachable?'online':'offline'}">
       <div class="ch">
-        <div class="ch-name"><span class="dot ${c.reachable?'dot-on':'dot-off'}"></span>${c.name}<span class="badge ${c.reachable?'b-on':'b-off'}">${c.reachable?'Online':'Offline'}</span></div>
-        <div class="ch-id">${c.id}</div>
-        ${cs.length?`<div class="ch-srv">↔ ${cs.map(sv=>sv.name||'Server '+sv.id).join(', ')}</div>`:''}
+        <div class="ch-name"><span class="dot ${c.reachable?'dot-on':'dot-off'}"></span>${esc(c.name)}<span class="badge ${c.reachable?'b-on':'b-off'}">${c.reachable?'Online':'Offline'}</span></div>
+        <div class="ch-id">${esc(c.id)}</div>
+        ${cs.length?`<div class="ch-srv">↔ ${cs.map(sv=>esc(sv.name||'Server '+sv.id)).join(', ')}</div>`:''}
       </div>
       ${c.reachable?`
       <div class="cstats">
@@ -809,7 +816,7 @@ function renderClients(s){
         <div class="cst"><div class="v u">${fmtS(c.bytes_in_per_sec)}</div><div class="l">Up/s</div></div>
         <div class="cst"><div class="v">${fmtB(c.total_bytes_out+c.total_bytes_in)}</div><div class="l">Traffic</div></div>
       </div>
-      <div class="cfooter">${c.stats_url}</div>`:`<div class="cunreach">Client nicht erreichbar</div>`}
+      <div class="cfooter">${esc(c.stats_url)}</div>`:`<div class="cunreach">Client nicht erreichbar</div>`}
     </div>`;
   }).join('');
 }
@@ -821,8 +828,8 @@ function renderMon(s){
   const idle=T.filter(t=>t.online&&t.active_connections===0&&t.bytes_in_per_sec===0&&t.bytes_out_per_sec===0);
   const off=T.filter(t=>!t.online);
   const card=(t,full=true)=>`
-    <div class="mc ${full?'live':''} ${full?'clickable':''}" ${full?`onclick="openConnections(${t.id},'${(t.name||t.subdomain).replace(/'/g,"&#39;")}')" title="Klicken für Verbindungsdetails"`:''}>
-      <div class="mc-h">${dotEl(t.online,t.tunnel_status)}<span class="mc-n">${t.name||t.subdomain}</span>${pb(t.protocol)}</div>
+    <div class="mc ${full?'live':''} ${full?'clickable':''}" ${full?`onclick="openConnections(${t.id},'${esc(t.name||t.subdomain)}')" title="Klicken für Verbindungsdetails"`:''}>
+      <div class="mc-h">${dotEl(t.online,t.tunnel_status)}<span class="mc-n">${esc(t.name||t.subdomain)}</span>${pb(t.protocol)}</div>
       ${full?`<div class="mc-m">
         <div class="mm"><div class="v vd">${fmtS(t.bytes_out_per_sec)}</div><div class="l">Down/s</div></div>
         <div class="mm"><div class="v vu">${fmtS(t.bytes_in_per_sec)}</div><div class="l">Up/s</div></div>
@@ -976,14 +983,14 @@ function renderConnections(conns) {
     '</tr></thead><tbody>';
   for (const c of conns) {
     h += '<tr>' +
-      `<td><span class="conn-ip">${c.peer_ip}</span></td>` +
+      `<td><span class="conn-ip">${esc(c.peer_ip)}</span></td>` +
       `<td style="color:var(--text-muted);font-size:12px">${fmtUp(c.connected_secs)}</td>` +
       `<td style="color:var(--accent);font-weight:600">${fmtS(c.bytes_out_per_sec)}</td>` +
       `<td style="color:var(--green);font-weight:600">${fmtS(c.bytes_in_per_sec)}</td>` +
       `<td style="color:var(--text-muted);font-size:12px">${fmtB(c.bytes_out)}</td>` +
       `<td style="color:var(--text-muted);font-size:12px">${fmtB(c.bytes_in)}</td>` +
       `<td><button class="btn btn-del btn-xs" title="Verbindung trennen"` +
-      ` onclick="disconnectConn(${connDbId},${c.stream_id},'${c.peer_ip}')">✕ Trennen</button></td>` +
+      ` onclick="disconnectConn(${connDbId},${c.stream_id},'${esc(c.peer_ip)}')">✕ Trennen</button></td>` +
       '</tr>';
   }
   h += '</tbody></table>';

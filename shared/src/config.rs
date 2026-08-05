@@ -17,6 +17,10 @@ pub struct ClientConfig {
     /// and reports status back.  Defaults to 5.
     #[serde(default = "default_client_poll")]
     pub poll_interval_secs: u64,
+    /// Shared secret required by the manager's HTTP API (sent as the
+    /// `X-Api-Key` header on every request to `manager_url`). Must match
+    /// `api_key` in the manager's config.
+    pub manager_api_key: String,
     /// Server connection details (TLS CA, address, secret). The manager
     /// decides which server_id to use; the client looks up the entry here.
     pub servers: Vec<ServerEntry>,
@@ -55,11 +59,18 @@ pub struct ServerConfig {
     pub tls_cert: String,
     pub tls_key: String,
     /// Address the management HTTP listener binds to.
-    /// Defaults to "0.0.0.0:9001". The manager must be able to reach this.
+    /// Defaults to "127.0.0.1:9001" — bind this to a private/VPN interface
+    /// (or leave on loopback and reach it via SSH tunnel / VPN) rather than
+    /// 0.0.0.0 in production, even though `mgmt_secret` also protects it.
     #[serde(default = "default_mgmt_bind")]
     pub mgmt_bind_address: String,
+    /// Shared secret required on every request to the management HTTP API
+    /// (`/api/manager/pre-auth`, `/api/connections`, ...), sent as the
+    /// `X-Mgmt-Secret` header. Must match the corresponding server entry's
+    /// `mgmt_secret` in the manager's config.
+    pub mgmt_secret: String,
 }
-fn default_mgmt_bind() -> String { "0.0.0.0:9001".to_string() }
+fn default_mgmt_bind() -> String { "127.0.0.1:9001".to_string() }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ManagerConfig {
@@ -70,6 +81,9 @@ pub struct ManagerConfig {
     #[serde(default = "default_assign_interval")]
     pub assign_interval_secs: u64,
     pub servers: Vec<ManagedServer>,
+    /// Shared secret that callers (game-tunnel clients, the web panel) must
+    /// send as the `X-Api-Key` header on every request to this API.
+    pub api_key: String,
 }
 fn default_assign_interval() -> u64 { 5 }
 
@@ -112,6 +126,9 @@ pub struct ManagedServer {
     /// Management API URL of this server (reachable from manager).
     /// Example: "http://10.0.0.2:9001"
     pub mgmt_url: String,
+    /// Shared secret for this server's management API. Must match
+    /// `mgmt_secret` in that server's own config.
+    pub mgmt_secret: String,
 }
 
 impl ClientConfig { pub fn load(path: &Path) -> anyhow::Result<Self> { Ok(toml::from_str(&std::fs::read_to_string(path)?)?) } }

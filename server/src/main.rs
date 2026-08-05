@@ -36,6 +36,11 @@ const UDP_SESSION_TIMEOUT_SECS: u64 = 300;
 /// 256 KB is large enough for most game update bursts while keeping
 /// per-connection overhead low.
 const SOCKET_BUF_SIZE: usize = 256 * 1024;
+/// Send/receive buffer size for tunnel UDP sockets. Each UDP socket here
+/// multiplexes *every* player on that tunnel port, so it needs a much
+/// bigger cushion than a single TCP connection's buffer to avoid kernel-side
+/// packet drops during bursts (movement updates, chunk data, etc.).
+const UDP_SOCKET_BUF_SIZE: usize = 4 * 1024 * 1024;
 /// Pre-auth cache entries expire after 10 seconds.
 /// The client must connect within this window after the manager sends the
 /// pre-auth notification, otherwise the connection will be rejected.
@@ -74,6 +79,33 @@ type ConnRegistry = Arc<RwLock<HashMap<u64, ConnRecord>>>;
 struct MgmtState {
     pre_auth_cache: PreAuthCache,
     registry: ConnRegistry,
+    mgmt_secret: Arc<String>,
+}
+
+/// Requires a valid `X-Mgmt-Secret` header matching `state.mgmt_secret`.
+/// This management API lets a caller list/kick player connections and grant
+/// tunnel pre-auth for any client UUID, so it must not be reachable without
+/// this shared secret even when bound to a private network.
+async fn mgmt_auth_middleware(
+    axum::extract::State(state): axum::extract::State<MgmtState>,
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    let expected = state.mgmt_secret.as_bytes();
+    let provided = req
+        .headers()
+        .get("X-Mgmt-Secret")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .as_bytes();
+    let valid = !expected.is_empty()
+        && expected.len() == provided.len()
+        && expected.iter().zip(provided.iter()).fold(0u8, |acc, (a, b)| acc | (a ^ b)) == 0;
+    if valid {
+        next.run(req).await
+    } else {
+        (StatusCode::UNAUTHORIZED, "invalid or missing X-Mgmt-Secret").into_response()
+    }
 }
 
 /// JSON payload returned by `GET /api/connections`.
@@ -231,6 +263,7 @@ async fn start_mgmt_server(bind_addr: String, state: MgmtState) {
         .route("/api/manager/pre-auth",           post(handle_pre_auth_request))
         .route("/api/connections",                 get(handle_get_connections))
         .route("/api/connections/{stream_id}",     delete(handle_disconnect_connection))
+        .layer(axum::middleware::from_fn_with_state(state.clone(), mgmt_auth_middleware))
         .with_state(state);
 
     info!("Server management API listening on {}", bind_addr);
@@ -298,6 +331,9 @@ async fn main() -> Result<()> {
 
     let config_path = std::env::args().nth(1).map(PathBuf::from).unwrap_or_else(|| PathBuf::from("server.toml"));
     let config = ServerConfig::load(&config_path).with_context(|| format!("failed to load {:?}", config_path))?;
+    if config.mgmt_secret.trim().is_empty() {
+        anyhow::bail!("server.toml: `mgmt_secret` must be set to a non-empty shared secret");
+    }
 
     info!("Loading TLS certificate from {}", config.tls_cert);
     let tls_acceptor = TlsAcceptor::from(load_tls_config(&config.tls_cert, &config.tls_key)?);
@@ -314,6 +350,7 @@ async fn main() -> Result<()> {
     let mgmt_state = MgmtState {
         pre_auth_cache: Arc::clone(&pre_auth_cache),
         registry: Arc::clone(&registry),
+        mgmt_secret: Arc::new(config.mgmt_secret.clone()),
     };
     let mgmt_addr = config.mgmt_bind_address.clone();
     tokio::spawn(start_mgmt_server(mgmt_addr, mgmt_state));
@@ -487,13 +524,27 @@ async fn handle_client(
 
     let (write_tx, mut write_rx) = mpsc::channel::<Frame>(8192);
     let writer_task = tokio::spawn(async move {
-        while let Some(frame) = write_rx.recv().await {
-            let r = match &frame {
-                Frame::Control(msg) => protocol::write_control(&mut write_half, msg).await,
-                Frame::Data { stream_id, payload } => protocol::write_data(&mut write_half, *stream_id, payload).await,
-                Frame::StreamClose { stream_id } => protocol::write_stream_close(&mut write_half, *stream_id).await,
-            };
-            if let Err(_) = r { break; }
+        'outer: while let Some(first) = write_rx.recv().await {
+            // Drain whatever else is already queued so many small frames
+            // (common with lots of concurrent player connections) share a
+            // single flush/syscall instead of one each. This never delays a
+            // frame that's alone in the queue — it only batches what has
+            // already arrived, so latency for the common (single-frame)
+            // case is unaffected.
+            let mut batch = vec![first];
+            while let Ok(next) = write_rx.try_recv() {
+                batch.push(next);
+                if batch.len() >= 256 { break; } // cap to bound worst-case latency
+            }
+            for frame in &batch {
+                let r = match frame {
+                    Frame::Control(msg) => protocol::write_control_noflush(&mut write_half, msg).await,
+                    Frame::Data { stream_id, payload } => protocol::write_data_noflush(&mut write_half, *stream_id, payload).await,
+                    Frame::StreamClose { stream_id } => protocol::write_stream_close_noflush(&mut write_half, *stream_id).await,
+                };
+                if r.is_err() { break 'outer; }
+            }
+            if write_half.flush().await.is_err() { break 'outer; }
         }
     });
 
@@ -631,7 +682,22 @@ async fn handle_control_message(
             if protocol == TunnelProtocol::Udp || protocol == TunnelProtocol::Both {
                 let addr_str = format!("{}:{}", bind_addr, remote_port);
                 let socket = match UdpSocket::bind(&addr_str).await {
-                    Ok(s) => Arc::new(s),
+                    Ok(s) => {
+                        // Default kernel UDP buffers (often ~200 KB or less) are too
+                        // small once one socket multiplexes many players' bursty
+                        // traffic (Rust, ARK, Valheim, Minecraft Bedrock/RakNet, ...);
+                        // packets get dropped by the kernel before our code ever
+                        // sees them. Size generously — this is one socket shared by
+                        // every player on this tunnel, not a per-player buffer.
+                        let sock_ref = socket2::SockRef::from(&s);
+                        if let Err(e) = sock_ref.set_recv_buffer_size(UDP_SOCKET_BUF_SIZE) {
+                            warn!("Failed to set UDP SO_RCVBUF for port {}: {:?}", remote_port, e);
+                        }
+                        if let Err(e) = sock_ref.set_send_buffer_size(UDP_SOCKET_BUF_SIZE) {
+                            warn!("Failed to set UDP SO_SNDBUF for port {}: {:?}", remote_port, e);
+                        }
+                        Arc::new(s)
+                    }
                     Err(e) => {
                         error!("Failed to bind UDP port {}: {:?}", remote_port, e);
                         let _ = write_tx.send(Frame::Control(Message::CloseTunnel { tunnel_id })).await;
@@ -661,12 +727,30 @@ async fn handle_control_message(
                                 } else {
                                     // NAT-rebinding detection: same IP, different port.
                                     // Some routers/CGNAT reassign the UDP source port within
-                                    // seconds.  Instead of creating a new session (which would
+                                    // seconds. Instead of creating a new session (which would
                                     // break the in-progress game connection), we update the
-                                    // existing session to use the new address.
-                                    let rebind = peer_streams.iter()
-                                        .find(|(a, _)| a.ip() == peer_addr.ip())
-                                        .map(|(a, &sid)| (*a, sid));
+                                    // existing session to use the new address — but ONLY when
+                                    // there is exactly one existing session from that IP and it
+                                    // was active very recently. Multiple players can share a
+                                    // single public IP (mobile CGNAT, shared/hotel/campus
+                                    // networks), so a plain "same IP" match would silently merge
+                                    // two different players into one stream and cross-deliver
+                                    // their traffic. Requiring uniqueness + recency makes that
+                                    // far less likely; anything ambiguous falls through to
+                                    // "genuinely new connection" below instead.
+                                    const REBIND_WINDOW: std::time::Duration = std::time::Duration::from_secs(5);
+                                    let now = std::time::Instant::now();
+                                    let mut matches = peer_streams.iter()
+                                        .filter(|&(addr, _)| addr.ip() == peer_addr.ip())
+                                        .filter(|&(addr, _)| {
+                                            last_seen.get(addr)
+                                                .map(|t| now.duration_since(*t) < REBIND_WINDOW)
+                                                .unwrap_or(false)
+                                        });
+                                    let rebind = match (matches.next(), matches.next()) {
+                                        (Some((&addr, &sid)), None) => Some((addr, sid)), // exactly one candidate
+                                        _ => None, // none, or ambiguous (multiple players on this IP)
+                                    };
 
                                     if let Some((old_addr, existing_sid)) = rebind {
                                         info!("UDP NAT rebind detected: {} → {} (stream {})",

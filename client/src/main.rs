@@ -94,53 +94,6 @@ fn apply_socket_options(stream: &TcpStream) {
 /// Connects to a game-tunnel server, authenticates, and returns the TLS stream halves.
 /// Sends the client's UUID in the Auth message so the server can verify it against
 /// the pre-auth cache populated by the manager.
-// Diese Hilfsstruktur wird benötigt, um die TLS-Zertifikatsprüfung zu umgehen.
-// Sie akzeptiert jedes Zertifikat, damit die Verbindung lokal/selbstsigniert klappt.
-#[derive(Debug)]
-#[allow(dead_code)]
-struct NoCertificateVerification;
-
-impl rustls::client::danger::ServerCertVerifier for NoCertificateVerification {
-    fn verify_server_cert(
-        &self,
-        _end_entity: &rustls::pki_types::CertificateDer<'_>,
-        _intermediates: &[rustls::pki_types::CertificateDer<'_>],
-        _server_name: &rustls::pki_types::ServerName<'_>,
-        _ocsp_response: &[u8],
-        _now: rustls::pki_types::UnixTime,
-    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
-        Ok(rustls::client::danger::ServerCertVerified::assertion())
-    }
-
-    fn verify_tls12_signature(
-        &self,
-        _message: &[u8],
-        _cert: &rustls::pki_types::CertificateDer<'_>,
-        _dss: &rustls::DigitallySignedStruct,
-    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
-    }
-
-    fn verify_tls13_signature(
-        &self,
-        _message: &[u8],
-        _cert: &rustls::pki_types::CertificateDer<'_>,
-        _dss: &rustls::DigitallySignedStruct,
-    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
-    }
-
-    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
-        vec![
-            rustls::SignatureScheme::RSA_PKCS1_SHA256,
-            rustls::SignatureScheme::RSA_PKCS1_SHA384,
-            rustls::SignatureScheme::RSA_PKCS1_SHA512,
-            rustls::SignatureScheme::ECDSA_NISTP256_SHA256,
-            rustls::SignatureScheme::ECDSA_NISTP384_SHA384,
-            rustls::SignatureScheme::ED25519,
-        ]
-    }
-}
 
 async fn connect_to_server(
     entry: &ServerEntry,
@@ -494,8 +447,17 @@ async fn run_client(config: ClientConfig) -> Result<()> {
         Arc::new(RwLock::new(HashMap::new()));
 
     // HTTP client for manager queries (15s per-request timeout).
+    // The manager requires an X-Api-Key header on every request; set it as a
+    // default header here so every call site below gets it automatically.
+    let mut default_headers = reqwest::header::HeaderMap::new();
+    default_headers.insert(
+        "X-Api-Key",
+        reqwest::header::HeaderValue::from_str(&config.manager_api_key)
+            .context("manager_api_key contains invalid header characters")?,
+    );
     let http_client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(15))
+        .default_headers(default_headers)
         .build()?;
 
     // Connection manager: polls the manager every 10 s for the full server list
@@ -981,6 +943,19 @@ async fn handle_control_message(
                     info!("UDP stream {}: new connection, target={}", stream_id, local_addr_clone);
                     match tokio::net::UdpSocket::bind("0.0.0.0:0").await {
                         Ok(socket) => {
+                            // Give this per-player UDP socket the same generous
+                            // buffer as our TCP sockets so fast bursts (movement
+                            // updates, etc.) aren't dropped by the kernel before
+                            // we read them.
+                            {
+                                let sock_ref = socket2::SockRef::from(&socket);
+                                if let Err(e) = sock_ref.set_recv_buffer_size(SOCKET_BUF_SIZE) {
+                                    warn!("UDP stream {}: failed to set SO_RCVBUF: {:?}", stream_id, e);
+                                }
+                                if let Err(e) = sock_ref.set_send_buffer_size(SOCKET_BUF_SIZE) {
+                                    warn!("UDP stream {}: failed to set SO_SNDBUF: {:?}", stream_id, e);
+                                }
+                            }
                             info!("UDP stream {}: socket bound, connecting to {}", stream_id, local_addr_clone);
                             if socket.connect(&local_addr_clone).await.is_err() {
                                 warn!("UDP stream {}: connect to {} failed", stream_id, local_addr_clone);
