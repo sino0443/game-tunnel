@@ -59,9 +59,10 @@ pub struct ServerConfig {
     pub tls_cert: String,
     pub tls_key: String,
     /// Address the management HTTP listener binds to.
-    /// Defaults to "127.0.0.1:9001" — bind this to a private/VPN interface
-    /// (or leave on loopback and reach it via SSH tunnel / VPN) rather than
-    /// 0.0.0.0 in production, even though `mgmt_secret` also protects it.
+    /// Defaults to "0.0.0.0:9001" so the manager (often on a different host)
+    /// can reach it. Access control comes from `mgmt_secret` below, not from
+    /// network placement — if you *can* put this behind a firewall/VPN as
+    /// well, that's extra defense in depth, but it's not required.
     #[serde(default = "default_mgmt_bind")]
     pub mgmt_bind_address: String,
     /// Shared secret required on every request to the management HTTP API
@@ -70,7 +71,7 @@ pub struct ServerConfig {
     /// `mgmt_secret` in the manager's config.
     pub mgmt_secret: String,
 }
-fn default_mgmt_bind() -> String { "127.0.0.1:9001".to_string() }
+fn default_mgmt_bind() -> String { "0.0.0.0:9001".to_string() }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ManagerConfig {
