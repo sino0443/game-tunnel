@@ -1,9 +1,10 @@
 use anyhow::{Context, Result};
 
 use axum::Router;
-use axum::extract::{Path, State};
+use axum::extract::{Path, Request, State};
 use axum::http::StatusCode;
-use axum::response::{IntoResponse, Json};
+use axum::middleware::{self, Next};
+use axum::response::{IntoResponse, Json, Response};
 use axum::routing::{delete, get, post};
 use game_tunnel_shared::config::{CloudflareConfig, ManagerConfig};
 use serde::{Deserialize, Serialize};
@@ -106,6 +107,33 @@ struct AppState {
     http_client: reqwest::Client,
 }
 
+/// Requires a valid `X-Api-Key` header matching `config.api_key` on every
+/// request. This API is called by game-tunnel clients and the web panel
+/// over plain HTTP inside the deployment's private network, so without this
+/// check anyone able to reach `bind_address` could list tunnels/clients,
+/// force pre-auth for arbitrary client UUIDs, or kick player connections.
+async fn api_key_middleware(
+    State(state): State<Arc<AppState>>,
+    req: Request,
+    next: Next,
+) -> Response {
+    let expected = state.config.api_key.as_bytes();
+    let provided = req
+        .headers()
+        .get("X-Api-Key")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .as_bytes();
+    let valid = !expected.is_empty()
+        && expected.len() == provided.len()
+        && expected.iter().zip(provided.iter()).fold(0u8, |acc, (a, b)| acc | (a ^ b)) == 0;
+    if valid {
+        next.run(req).await
+    } else {
+        (StatusCode::UNAUTHORIZED, "invalid or missing X-Api-Key").into_response()
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt().with_env_filter(
@@ -115,6 +143,14 @@ async fn main() -> Result<()> {
 
     let config_path = std::env::args().nth(1).map(PathBuf::from).unwrap_or_else(|| PathBuf::from("manager.toml"));
     let config = ManagerConfig::load(&config_path).with_context(|| format!("failed to load {:?}", config_path))?;
+    if config.api_key.trim().is_empty() {
+        anyhow::bail!("manager.toml: `api_key` must be set to a non-empty shared secret");
+    }
+    for s in &config.servers {
+        if s.mgmt_secret.trim().is_empty() {
+            anyhow::bail!("manager.toml: server '{}' is missing `mgmt_secret`", s.name);
+        }
+    }
 
     let pool = database::connect(&config.database).await?;
     info!("Connected to MySQL");
@@ -169,6 +205,7 @@ async fn main() -> Result<()> {
         .route("/api/client/{uuid}/servers", get(get_servers_for_client))
         .route("/api/client/{client_id}/tunnels", get(list_client_tunnels))
         .route("/api/client/{client_id}/tunnel-status", post(update_client_tunnel_status))
+        .layer(middleware::from_fn_with_state(Arc::clone(&state), api_key_middleware))
         .layer(CorsLayer::permissive())
         .with_state(state);
 
@@ -393,7 +430,7 @@ async fn refresh_stats(state: &Arc<AppState>) -> Result<()> {
 
     for server in &state.config.servers {
         let url = format!("{}/api/connections", server.mgmt_url.trim_end_matches('/'));
-        match state.http_client.get(&url).send().await {
+        match state.http_client.get(&url).header("X-Mgmt-Secret", &server.mgmt_secret).send().await {
             Ok(resp) => match resp.json::<Vec<ServerConnData>>().await {
                 Ok(conns) => {
                     for conn in conns {
@@ -503,12 +540,12 @@ async fn disconnect_tunnel_connection(
         return (StatusCode::INTERNAL_SERVER_ERROR, "server config not found").into_response();
     };
     let url = format!("{}/api/connections/{}", server.mgmt_url.trim_end_matches('/'), stream_id);
-    match state.http_client.delete(&url).send().await {
+    match state.http_client.delete(&url).header("X-Mgmt-Secret", &server.mgmt_secret).send().await {
         Ok(resp) if resp.status().is_success() => {
             Json(serde_json::json!({"message": "Disconnected"})).into_response()
         }
-        Ok(resp) => (StatusCode::BAD_GATEWAY, format!("server returned {}", resp.status())).into_response(),
-        Err(e)   => (StatusCode::BAD_GATEWAY, format!("cannot reach server: {}", e)).into_response(),
+        Ok(resp) => { warn!("server returned {} for disconnect", resp.status()); (StatusCode::BAD_GATEWAY, "server rejected disconnect").into_response() }
+        Err(e)   => { error!("cannot reach server: {:?}", e); (StatusCode::BAD_GATEWAY, "cannot reach server").into_response() }
     }
 }
 
@@ -552,8 +589,8 @@ async fn get_server_for_client(
 
     // 2. Find the server's management URL in config.
     let server_cfg = state.config.servers.iter().find(|s| s.id == mapping.server_id);
-    let mgmt_url = match server_cfg {
-        Some(s) => s.mgmt_url.clone(),
+    let (mgmt_url, mgmt_secret) = match server_cfg {
+        Some(s) => (s.mgmt_url.clone(), s.mgmt_secret.clone()),
         None => {
             error!(
                 "Server id {} from mapping not found in manager config",
@@ -572,7 +609,7 @@ async fn get_server_for_client(
 
     let notify_result = tokio::time::timeout(
         tokio::time::Duration::from_secs(10),
-        state.http_client.post(&pre_auth_url).json(&body).send(),
+        state.http_client.post(&pre_auth_url).header("X-Mgmt-Secret", &mgmt_secret).json(&body).send(),
     )
     .await;
 
@@ -718,13 +755,14 @@ async fn get_servers_for_client(
         .filter_map(|&sid| {
             let cfg = state.config.servers.iter().find(|s| s.id == sid)?;
             let url = format!("{}/api/manager/pre-auth", cfg.mgmt_url.trim_end_matches('/'));
+            let secret = cfg.mgmt_secret.clone();
             let body = serde_json::json!({ "client_uuid": uuid });
             let http = state.http_client.clone();
             let uuid_c = uuid.clone();
             Some((sid, tokio::spawn(async move {
                 tokio::time::timeout(
                     tokio::time::Duration::from_secs(10),
-                    http.post(&url).json(&body).send(),
+                    http.post(&url).header("X-Mgmt-Secret", &secret).json(&body).send(),
                 )
                 .await
                 .map(|r| r.map(|resp| (resp.status().is_success(), uuid_c)))
@@ -809,7 +847,7 @@ async fn list_client_tunnels(
         }
         Err(e) => {
             error!("Failed to fetch tunnels for client '{}': {:?}", client_id, e);
-            (StatusCode::INTERNAL_SERVER_ERROR, format!("{}", e)).into_response()
+            (StatusCode::INTERNAL_SERVER_ERROR, "internal server error").into_response()
         }
     }
 }

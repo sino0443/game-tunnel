@@ -25,6 +25,11 @@ struct WebConfig {
     cloudflare: CloudflareConfig,
     #[serde(default)]
     manager_url: Option<String>,
+    /// Shared secret sent as `X-Api-Key` on every request to `manager_url`.
+    /// Required whenever `manager_url` is set (must match the manager's
+    /// `api_key`).
+    #[serde(default)]
+    manager_api_key: Option<String>,
     #[serde(default)]
     servers: Vec<WebServerEntry>,
     #[serde(default)]
@@ -41,9 +46,21 @@ struct AppState {
     db: MySqlPool,
     cf: CloudflareConfig,
     manager_url: Option<String>,
+    manager_api_key: Option<String>,
     servers: Vec<WebServerEntry>,
     admin_credentials: Option<String>,
     http_client: reqwest::Client,
+}
+
+/// Attaches the `X-Api-Key` header for manager requests, if configured.
+fn with_manager_auth(
+    state: &Arc<AppState>,
+    b: reqwest::RequestBuilder,
+) -> reqwest::RequestBuilder {
+    match &state.manager_api_key {
+        Some(k) => b.header("X-Api-Key", k),
+        None => b,
+    }
 }
 
 async fn basic_auth_middleware(
@@ -107,8 +124,18 @@ async fn main() -> Result<()> {
     let content = std::fs::read_to_string(&config_path).with_context(|| format!("failed to read {:?}", config_path))?;
     let config: WebConfig = toml::from_str(&content)?;
 
-    if config.admin_credentials.is_none() { tracing::warn!("No admin_credentials configured!"); }
+    if config.admin_credentials.is_none() {
+        anyhow::bail!(
+            "No admin_credentials configured — refusing to start with an open admin panel. \
+             Set `admin_credentials = \"user:pass\"` in web.toml, or explicitly bind to \
+             127.0.0.1 and put a reverse proxy with auth in front if you really want no \
+             built-in auth."
+        );
+    }
     if config.manager_url.is_none() { tracing::warn!("No manager_url configured."); }
+    if config.manager_url.is_some() && config.manager_api_key.is_none() {
+        anyhow::bail!("manager_url is set but manager_api_key is missing — the manager API requires it.");
+    }
 
     let db_url = format!("mysql://{}:{}@{}:{}/{}", config.database.user, config.database.password, config.database.host, config.database.port, config.database.database);
     let pool = MySqlPoolOptions::new().max_connections(10).connect(&db_url).await.context("failed to connect to MySQL")?;
@@ -119,6 +146,7 @@ async fn main() -> Result<()> {
     let domains: Vec<String> = config.cloudflare.zones.iter().map(|z| z.domain.clone()).collect();
     let state = Arc::new(AppState {
         db: pool, cf: config.cloudflare, manager_url: config.manager_url,
+        manager_api_key: config.manager_api_key,
         servers: config.servers, admin_credentials: config.admin_credentials, http_client,
     });
 
@@ -207,7 +235,7 @@ fn row_to_tunnel(r: &sqlx::mysql::MySqlRow) -> TunnelResponse {
 async fn list_tunnels(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     match sqlx::query("SELECT * FROM tunnels ORDER BY protocol ASC, name ASC, id DESC").fetch_all(&state.db).await {
         Ok(rows) => Json(rows.iter().map(row_to_tunnel).collect::<Vec<_>>()).into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("{}", e)).into_response(),
+        Err(e) => { error!("db error: {:?}", e); (StatusCode::INTERNAL_SERVER_ERROR, "internal server error").into_response() },
     }
 }
 
@@ -215,7 +243,7 @@ async fn get_tunnel(State(state): State<Arc<AppState>>, Path(id): Path<u32>) -> 
     match sqlx::query("SELECT * FROM tunnels WHERE id = ?").bind(id).fetch_optional(&state.db).await {
         Ok(Some(r)) => Json(row_to_tunnel(&r)).into_response(),
         Ok(None) => (StatusCode::NOT_FOUND, "Not found").into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("{}", e)).into_response(),
+        Err(e) => { error!("db error: {:?}", e); (StatusCode::INTERNAL_SERVER_ERROR, "internal server error").into_response() },
     }
 }
 
@@ -227,7 +255,7 @@ async fn create_tunnel(State(state): State<Arc<AppState>>, Json(req): Json<Creat
 
     let mut tx = match state.db.begin().await {
         Ok(tx) => tx,
-        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, format!("{}", e)).into_response(),
+        Err(e) => { error!("db error: {:?}", e); return (StatusCode::INTERNAL_SERVER_ERROR, "internal server error").into_response(); },
     };
 
     // Read all existing IDs into a HashSet, then find the lowest free one in Rust.
@@ -238,7 +266,7 @@ async fn create_tunnel(State(state): State<Arc<AppState>>, Json(req): Json<Creat
         .fetch_all(&mut *tx).await
     {
         Ok(ids) => ids.into_iter().filter_map(|n| if n > 0 && n <= u32::MAX as u64 { Some(n as u32) } else { None }).collect(),
-        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, format!("{}", e)).into_response(),
+        Err(e) => { error!("db error: {:?}", e); return (StatusCode::INTERNAL_SERVER_ERROR, "internal server error").into_response(); },
     };
     // (1u32..) is infinite so unwrap_or is unreachable, but keeps the type checker happy.
     let next_id = (1u32..).find(|n| !taken.contains(n)).unwrap_or(1);
@@ -256,14 +284,16 @@ async fn create_tunnel(State(state): State<Arc<AppState>>, Json(req): Json<Creat
     {
         Ok(_) => {
             if let Err(e) = tx.commit().await {
-                return (StatusCode::INTERNAL_SERVER_ERROR, format!("{}", e)).into_response();
+                error!("commit error: {:?}", e);
+                return (StatusCode::INTERNAL_SERVER_ERROR, "internal server error").into_response();
             }
             info!("Created tunnel '{}' (subdomain={}, id={})", name, req.subdomain, next_id);
             (StatusCode::CREATED, Json(serde_json::json!({"message": "Created", "uuid": uuid, "id": next_id}))).into_response()
         }
         Err(e) => {
             let _ = tx.rollback().await;
-            (StatusCode::INTERNAL_SERVER_ERROR, format!("{}", e)).into_response()
+            error!("insert tunnel error: {:?}", e);
+            (StatusCode::INTERNAL_SERVER_ERROR, "internal server error").into_response()
         }
     }
 }
@@ -312,7 +342,7 @@ async fn update_tunnel(State(state): State<Arc<AppState>>, Path(id): Path<u32>, 
 
     match q.execute(&state.db).await {
         Ok(_) => Json(serde_json::json!({"message": "Updated"})).into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("{}", e)).into_response(),
+        Err(e) => { error!("db error: {:?}", e); (StatusCode::INTERNAL_SERVER_ERROR, "internal server error").into_response() },
     }
 }
 
@@ -326,7 +356,7 @@ async fn delete_tunnel(State(state): State<Arc<AppState>>, Path(id): Path<u32>) 
             Json(serde_json::json!({"message": "Deleted"})).into_response()
         }
         Ok(None) => (StatusCode::NOT_FOUND, "Not found").into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("{}", e)).into_response(),
+        Err(e) => { error!("db error: {:?}", e); (StatusCode::INTERNAL_SERVER_ERROR, "internal server error").into_response() },
     }
 }
 
@@ -346,7 +376,7 @@ async fn start_tunnel(State(state): State<Arc<AppState>>, Path(id): Path<u32>) -
     .await
     {
         Ok(_) => Json(serde_json::json!({"message": "Started"})).into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("{}", e)).into_response(),
+        Err(e) => { error!("db error: {:?}", e); (StatusCode::INTERNAL_SERVER_ERROR, "internal server error").into_response() },
     }
 }
 
@@ -355,7 +385,7 @@ async fn stop_tunnel(State(state): State<Arc<AppState>>, Path(id): Path<u32>) ->
     // preserved when the tunnel is started again later.
     match sqlx::query("UPDATE tunnels SET online = FALSE, tunnel_status = 'stopped' WHERE id = ?").bind(id).execute(&state.db).await {
         Ok(_) => Json(serde_json::json!({"message": "Stopped"})).into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("{}", e)).into_response(),
+        Err(e) => { error!("db error: {:?}", e); (StatusCode::INTERNAL_SERVER_ERROR, "internal server error").into_response() },
     }
 }
 
@@ -367,12 +397,13 @@ async fn proxy_stats(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     let Some(ref url) = state.manager_url else {
         return Json(serde_json::json!({"error": "manager_url not configured"})).into_response();
     };
-    match state.http_client.get(&format!("{}/api/stats", url)).send().await {
+    let req = with_manager_auth(&state, state.http_client.get(&format!("{}/api/stats", url)));
+    match req.send().await {
         Ok(resp) => match resp.json::<serde_json::Value>().await {
             Ok(json) => Json(json).into_response(),
-            Err(e) => (StatusCode::BAD_GATEWAY, format!("parse error: {}", e)).into_response(),
+            Err(e) => { error!("manager /api/stats parse error: {:?}", e); (StatusCode::BAD_GATEWAY, "invalid response from manager").into_response() }
         },
-        Err(e) => (StatusCode::BAD_GATEWAY, format!("manager unavailable: {}", e)).into_response(),
+        Err(e) => { error!("manager unavailable: {:?}", e); (StatusCode::BAD_GATEWAY, "manager unavailable").into_response() }
     }
 }
 
@@ -380,12 +411,13 @@ async fn proxy_clients(State(state): State<Arc<AppState>>) -> impl IntoResponse 
     let Some(ref url) = state.manager_url else {
         return Json(serde_json::json!([])).into_response();
     };
-    match state.http_client.get(&format!("{}/api/clients", url)).send().await {
+    let req = with_manager_auth(&state, state.http_client.get(&format!("{}/api/clients", url)));
+    match req.send().await {
         Ok(resp) => match resp.json::<serde_json::Value>().await {
             Ok(json) => Json(json).into_response(),
-            Err(e) => (StatusCode::BAD_GATEWAY, format!("parse error: {}", e)).into_response(),
+            Err(e) => { error!("manager /api/clients parse error: {:?}", e); (StatusCode::BAD_GATEWAY, "invalid response from manager").into_response() }
         },
-        Err(e) => (StatusCode::BAD_GATEWAY, format!("manager unavailable: {}", e)).into_response(),
+        Err(e) => { error!("manager unavailable: {:?}", e); (StatusCode::BAD_GATEWAY, "manager unavailable").into_response() }
     }
 }
 
@@ -401,12 +433,13 @@ async fn proxy_tunnel_connections(
     let Some(ref url) = state.manager_url else {
         return Json(serde_json::json!([])).into_response();
     };
-    match state.http_client.get(&format!("{}/api/tunnels/{}/connections", url, id)).send().await {
+    let req = with_manager_auth(&state, state.http_client.get(&format!("{}/api/tunnels/{}/connections", url, id)));
+    match req.send().await {
         Ok(resp) => match resp.json::<serde_json::Value>().await {
             Ok(json) => Json(json).into_response(),
-            Err(e) => (StatusCode::BAD_GATEWAY, format!("parse error: {}", e)).into_response(),
+            Err(e) => { error!("manager connections parse error: {:?}", e); (StatusCode::BAD_GATEWAY, "invalid response from manager").into_response() }
         },
-        Err(e) => (StatusCode::BAD_GATEWAY, format!("manager unavailable: {}", e)).into_response(),
+        Err(e) => { error!("manager unavailable: {:?}", e); (StatusCode::BAD_GATEWAY, "manager unavailable").into_response() }
     }
 }
 
@@ -418,14 +451,13 @@ async fn proxy_disconnect_connection(
     let Some(ref url) = state.manager_url else {
         return (StatusCode::SERVICE_UNAVAILABLE, "manager_url not configured").into_response();
     };
-    match state.http_client
-        .delete(&format!("{}/api/tunnels/{}/connections/{}", url, id, stream_id))
-        .send().await
-    {
+    let req = with_manager_auth(&state, state.http_client
+        .delete(&format!("{}/api/tunnels/{}/connections/{}", url, id, stream_id)));
+    match req.send().await {
         Ok(resp) => match resp.json::<serde_json::Value>().await {
             Ok(json) => Json(json).into_response(),
-            Err(e) => (StatusCode::BAD_GATEWAY, format!("parse error: {}", e)).into_response(),
+            Err(e) => { error!("manager disconnect parse error: {:?}", e); (StatusCode::BAD_GATEWAY, "invalid response from manager").into_response() }
         },
-        Err(e) => (StatusCode::BAD_GATEWAY, format!("manager unavailable: {}", e)).into_response(),
+        Err(e) => { error!("manager unavailable: {:?}", e); (StatusCode::BAD_GATEWAY, "manager unavailable").into_response() }
     }
 }
