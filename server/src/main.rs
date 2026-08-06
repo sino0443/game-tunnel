@@ -524,27 +524,20 @@ async fn handle_client(
 
     let (write_tx, mut write_rx) = mpsc::channel::<Frame>(8192);
     let writer_task = tokio::spawn(async move {
-        'outer: while let Some(first) = write_rx.recv().await {
-            // Drain whatever else is already queued so many small frames
-            // (common with lots of concurrent player connections) share a
-            // single flush/syscall instead of one each. This never delays a
-            // frame that's alone in the queue — it only batches what has
-            // already arrived, so latency for the common (single-frame)
-            // case is unaffected.
-            let mut batch = vec![first];
-            while let Ok(next) = write_rx.try_recv() {
-                batch.push(next);
-                if batch.len() >= 256 { break; } // cap to bound worst-case latency
-            }
-            for frame in &batch {
-                let r = match frame {
-                    Frame::Control(msg) => protocol::write_control_noflush(&mut write_half, msg).await,
-                    Frame::Data { stream_id, payload } => protocol::write_data_noflush(&mut write_half, *stream_id, payload).await,
-                    Frame::StreamClose { stream_id } => protocol::write_stream_close_noflush(&mut write_half, *stream_id).await,
-                };
-                if r.is_err() { break 'outer; }
-            }
-            if write_half.flush().await.is_err() { break 'outer; }
+        // NOTE: this used to batch several queued frames per flush to cut
+        // down on syscalls under load. That change went out in the same
+        // release as several other fixes and coincided with reports of
+        // widespread player disconnects / stuck "ghost" connections in
+        // production, so it's reverted here out of caution while it gets
+        // investigated properly, back to the simple, previously-stable
+        // one-frame-one-flush behavior.
+        while let Some(frame) = write_rx.recv().await {
+            let r = match &frame {
+                Frame::Control(msg) => protocol::write_control(&mut write_half, msg).await,
+                Frame::Data { stream_id, payload } => protocol::write_data(&mut write_half, *stream_id, payload).await,
+                Frame::StreamClose { stream_id } => protocol::write_stream_close(&mut write_half, *stream_id).await,
+            };
+            if r.is_err() { break; }
         }
     });
 
