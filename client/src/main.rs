@@ -383,6 +383,27 @@ async fn run_server_task(
                 };
                 if !to_remove.is_empty() {
                     let mut st = state.write().await;
+
+                    // Close any open local streams for the tunnels on this server.
+                    // Dropping LocalStream.tx causes handle_local_stream's write_task
+                    // to exit (channel closed → write_task gets None → select exits),
+                    // which cleanly tears down the local TCP/UDP socket to the game
+                    // server.  Without this, the game server would see phantom player
+                    // connections (open sockets receiving no data) until the OS-level
+                    // idle timeout fires — potentially many minutes later.
+                    let tunnel_ids_on_server: std::collections::HashSet<u32> =
+                        to_remove.iter().map(|&(_, tid)| tid).collect();
+                    let stale_stream_ids: Vec<u64> = st
+                        .stream_tunnel
+                        .iter()
+                        .filter(|(_, &tid)| tunnel_ids_on_server.contains(&tid))
+                        .map(|(&sid, _)| sid)
+                        .collect();
+                    for sid in stale_stream_ids {
+                        st.streams.remove(&sid);      // drops LocalStream.tx
+                        st.stream_tunnel.remove(&sid);
+                    }
+
                     for (db_id, tunnel_id) in &to_remove {
                         if let Some(t) = st.tunnels.remove(db_id) {
                             st.tunnel_local_addrs.remove(&t.tunnel_id);
