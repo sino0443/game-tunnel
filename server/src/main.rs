@@ -941,11 +941,19 @@ async fn handle_player_stream(
         _ = &mut write_task => {}
         _ = kill_rx.changed() => {
             // Forced disconnect via DELETE /api/connections/{stream_id}.
-            // Abort both I/O tasks so the player socket is closed promptly.
             read_task.abort();
             write_task.abort();
         }
     }
+    // Abort whichever task is still running so both socket halves are
+    // closed immediately.  Without this the "loser" task keeps its
+    // OwnedReadHalf (pr) or OwnedWriteHalf (pw) alive, leaving the
+    // player's TCP connection half-open.  The player's game client will
+    // not detect the disconnect until it tries to write — which may not
+    // happen for a long time on a quiet connection — so the player stays
+    // on-screen in the game until the OS-level timeout fires.
+    read_task.abort();
+    write_task.abort();
     let _ = to_tunnel.send(Frame::StreamClose { stream_id }).await;
     let mut st = state.write().await;
     st.streams.remove(&stream_id);
