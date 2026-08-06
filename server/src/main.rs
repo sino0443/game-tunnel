@@ -760,14 +760,21 @@ async fn handle_control_message(
                                     // break the in-progress game connection), we update the
                                     // existing session to use the new address — but ONLY when
                                     // there is exactly one existing session from that IP and it
-                                    // was active very recently. Multiple players can share a
+                                    // was active recently. Multiple players can share a
                                     // single public IP (mobile CGNAT, shared/hotel/campus
                                     // networks), so a plain "same IP" match would silently merge
                                     // two different players into one stream and cross-deliver
                                     // their traffic. Requiring uniqueness + recency makes that
                                     // far less likely; anything ambiguous falls through to
                                     // "genuinely new connection" below instead.
-                                    const REBIND_WINDOW: std::time::Duration = std::time::Duration::from_secs(5);
+                                    //
+                                    // 60 s gives players enough time to alt-tab, pause the game,
+                                    // or wait through a loading screen without their session being
+                                    // dropped.  The original 5 s window was too short — any
+                                    // player idle for more than 5 seconds after a NAT port change
+                                    // was treated as a new connection, leaving their old session
+                                    // as a ghost in the registry for up to 5 minutes.
+                                    const REBIND_WINDOW: std::time::Duration = std::time::Duration::from_secs(60);
                                     let now = std::time::Instant::now();
                                     let mut matches = peer_streams.iter()
                                         .filter(|&(addr, _)| addr.ip() == peer_addr.ip())
