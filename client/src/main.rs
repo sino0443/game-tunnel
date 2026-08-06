@@ -849,11 +849,24 @@ async fn sync_tunnels(
 /// Builds a Proxy Protocol v1 header string for the given peer address and
 /// local game server address.
 ///
-/// Format: `PROXY TCP4 <src_ip> <dst_ip> <src_port> <dst_port>\r\n`
+/// ## Address-family rules
 ///
-/// Velocity and HAProxy use this to determine the real client IP.  Falls back
-/// to `PROXY UNKNOWN\r\n` when the peer address is not available (old server
-/// that doesn't send it) or the addresses cannot be parsed.
+/// PROXY Protocol v1 requires `TCP4` to carry two IPv4 addresses and `TCP6`
+/// to carry two IPv6 addresses.  A mixed header — e.g. `TCP6 <ipv6> <ipv4>`
+/// — is syntactically invalid.  Velocity (and HAProxy) close such connections
+/// silently: the Minecraft client keeps the TCP socket open but never receives
+/// a status response, producing a permanent "Pinging…" indicator in the
+/// server list while game login connections that happen to be pure IPv4 still
+/// work fine.
+///
+/// The most common source of the mismatch is dual-stack VPS sockets: when an
+/// IPv4 game client connects to a socket bound to `::` (all interfaces), Linux
+/// presents the source address as an IPv4-mapped IPv6 address (::ffff:x.x.x.x)
+/// rather than a plain IPv4 one.  We detect this case and downgrade to a
+/// proper TCP4 header so both address fields always have the same family.
+///
+/// Falls back to `PROXY UNKNOWN\r\n` only when the peer address is genuinely
+/// unavailable (old server that predates the peer_addr field in NewConnection).
 fn build_proxy_protocol_header(
     peer_addr: Option<std::net::SocketAddr>,
     local_addr: &str,
@@ -877,10 +890,28 @@ fn build_proxy_protocol_header(
 
     let (proto, src_ip_str, dst_ip_str) = match peer {
         std::net::SocketAddr::V4(v4) => {
+            // Pure IPv4 client — straightforward TCP4 header.
             ("TCP4", v4.ip().to_string(), dst_ip.to_string())
         }
         std::net::SocketAddr::V6(v6) => {
-            ("TCP6", v6.ip().to_string(), dst_ip.to_string())
+            // IPv4-mapped IPv6 address (::ffff:a.b.c.d).  Linux dual-stack
+            // sockets present IPv4 clients this way.  Unwrap to the real
+            // IPv4 address and emit a valid TCP4 header.
+            if let Some(ipv4) = v6.ip().to_ipv4_mapped() {
+                ("TCP4", ipv4.to_string(), dst_ip.to_string())
+            } else {
+                // Genuine IPv6 client.  If the configured destination is an
+                // IPv4 address, "TCP6 <ipv6> <ipv4>" would be invalid — use
+                // the IPv6 loopback (::1) as the destination so that both
+                // address fields share the same family.  Velocity only reads
+                // the source address from the PROXY header anyway.
+                let dst = if dst_ip.contains(':') {
+                    dst_ip.to_string() // destination is already IPv6 — use as-is
+                } else {
+                    "::1".to_string()  // IPv4 destination → substitute IPv6 loopback
+                };
+                ("TCP6", v6.ip().to_string(), dst)
+            }
         }
     };
 
