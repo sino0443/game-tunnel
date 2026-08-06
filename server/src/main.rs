@@ -754,94 +754,38 @@ async fn handle_control_message(
                                 let stream_id = if let Some(&sid) = peer_streams.get(&peer_addr) {
                                     sid
                                 } else {
-                                    // NAT-rebinding detection: same IP, different port.
-                                    // Some routers/CGNAT reassign the UDP source port within
-                                    // seconds. Instead of creating a new session (which would
-                                    // break the in-progress game connection), we update the
-                                    // existing session to use the new address — but ONLY when
-                                    // there is exactly one existing session from that IP and it
-                                    // was active recently. Multiple players can share a
-                                    // single public IP (mobile CGNAT, shared/hotel/campus
-                                    // networks), so a plain "same IP" match would silently merge
-                                    // two different players into one stream and cross-deliver
-                                    // their traffic. Requiring uniqueness + recency makes that
-                                    // far less likely; anything ambiguous falls through to
-                                    // "genuinely new connection" below instead.
-                                    //
-                                    // 60 s gives players enough time to alt-tab, pause the game,
-                                    // or wait through a loading screen without their session being
-                                    // dropped.  The original 5 s window was too short — any
-                                    // player idle for more than 5 seconds after a NAT port change
-                                    // was treated as a new connection, leaving their old session
-                                    // as a ghost in the registry for up to 5 minutes.
-                                    const REBIND_WINDOW: std::time::Duration = std::time::Duration::from_secs(60);
-                                    let now = std::time::Instant::now();
-                                    let mut matches = peer_streams.iter()
-                                        .filter(|&(addr, _)| addr.ip() == peer_addr.ip())
-                                        .filter(|&(addr, _)| {
-                                            last_seen.get(addr)
-                                                .map(|t| now.duration_since(*t) < REBIND_WINDOW)
-                                                .unwrap_or(false)
-                                        });
-                                    let rebind = match (matches.next(), matches.next()) {
-                                        (Some((&addr, &sid)), None) => Some((addr, sid)), // exactly one candidate
-                                        _ => None, // none, or ambiguous (multiple players on this IP)
-                                    };
-
-                                    if let Some((old_addr, existing_sid)) = rebind {
-                                        info!("UDP NAT rebind detected: {} → {} (stream {})",
-                                              old_addr, peer_addr, existing_sid);
-                                        peer_streams.remove(&old_addr);
-                                        last_seen.remove(&old_addr);
-                                        peer_streams.insert(peer_addr, existing_sid);
-                                        last_seen.insert(peer_addr, std::time::Instant::now());
-                                        // Update the stored peer address so responses go to new port.
-                                        let existing_bytes_out = peer_bytes_out.get(&existing_sid)
-                                            .cloned()
-                                            .unwrap_or_else(|| Arc::new(AtomicU64::new(0)));
-                                        {
-                                            let mut st = state_udp.write().await;
-                                            st.udp_peers.insert(existing_sid, UdpPeer {
-                                                addr: peer_addr,
-                                                socket: Arc::clone(&socket),
-                                                bytes_out: existing_bytes_out,
-                                            });
-                                        }
-                                        existing_sid
-                                    } else {
-                                        // Genuinely new player connection.
-                                        let sid = STREAM_ID_COUNTER.fetch_add(1, Ordering::Relaxed);
-                                        peer_streams.insert(peer_addr, sid);
-                                        let bytes_in     = Arc::new(AtomicU64::new(0));
-                                        let bytes_out    = Arc::new(AtomicU64::new(0));
-                                        let bytes_in_ps  = Arc::new(AtomicU64::new(0));
-                                        let bytes_out_ps = Arc::new(AtomicU64::new(0));
-                                        peer_bytes_in.insert(sid,  Arc::clone(&bytes_in));
-                                        peer_bytes_out.insert(sid, Arc::clone(&bytes_out));
-                                        let db_id_val = state_udp.read().await.tunnels.get(&tunnel_id).map(|t| t.db_id).unwrap_or(0);
-                                        // kill_rx is not actively watched for UDP (no per-peer task);
-                                        // the kill_tx is still stored so DELETE /api/connections/{sid}
-                                        // can remove the registry entry cleanly.
-                                        let (kill_tx, _kill_rx) = watch::channel(false);
-                                        registry_udp.write().await.insert(sid, ConnRecord {
-                                            db_id:             db_id_val,
-                                            tunnel_id,
-                                            peer_ip:           peer_addr.ip().to_string(),
-                                            bytes_in:          Arc::clone(&bytes_in),
-                                            bytes_out:         Arc::clone(&bytes_out),
-                                            bytes_in_per_sec:  Arc::clone(&bytes_in_ps),
-                                            bytes_out_per_sec: Arc::clone(&bytes_out_ps),
-                                            connected_at:      Instant::now(),
-                                            kill_tx,
-                                        });
-                                        {
-                                            let mut st = state_udp.write().await;
-                                            st.udp_peers.insert(sid, UdpPeer { addr: peer_addr, socket: Arc::clone(&socket), bytes_out });
-                                            st.stream_tunnel.insert(sid, tunnel_id);
-                                        }
-                                        let _ = write_tx_udp.send(Frame::Control(Message::NewConnection { tunnel_id, stream_id: sid, is_udp: true, peer_addr: Some(peer_addr) })).await;
-                                        sid
+                                    // New player connection — unknown IP:port.
+                                    let sid = STREAM_ID_COUNTER.fetch_add(1, Ordering::Relaxed);
+                                    peer_streams.insert(peer_addr, sid);
+                                    let bytes_in     = Arc::new(AtomicU64::new(0));
+                                    let bytes_out    = Arc::new(AtomicU64::new(0));
+                                    let bytes_in_ps  = Arc::new(AtomicU64::new(0));
+                                    let bytes_out_ps = Arc::new(AtomicU64::new(0));
+                                    peer_bytes_in.insert(sid,  Arc::clone(&bytes_in));
+                                    peer_bytes_out.insert(sid, Arc::clone(&bytes_out));
+                                    let db_id_val = state_udp.read().await.tunnels.get(&tunnel_id).map(|t| t.db_id).unwrap_or(0);
+                                    // kill_rx is not actively watched for UDP (no per-peer task);
+                                    // the kill_tx is still stored so DELETE /api/connections/{sid}
+                                    // can remove the registry entry cleanly.
+                                    let (kill_tx, _kill_rx) = watch::channel(false);
+                                    registry_udp.write().await.insert(sid, ConnRecord {
+                                        db_id:             db_id_val,
+                                        tunnel_id,
+                                        peer_ip:           peer_addr.ip().to_string(),
+                                        bytes_in:          Arc::clone(&bytes_in),
+                                        bytes_out:         Arc::clone(&bytes_out),
+                                        bytes_in_per_sec:  Arc::clone(&bytes_in_ps),
+                                        bytes_out_per_sec: Arc::clone(&bytes_out_ps),
+                                        connected_at:      Instant::now(),
+                                        kill_tx,
+                                    });
+                                    {
+                                        let mut st = state_udp.write().await;
+                                        st.udp_peers.insert(sid, UdpPeer { addr: peer_addr, socket: Arc::clone(&socket), bytes_out });
+                                        st.stream_tunnel.insert(sid, tunnel_id);
                                     }
+                                    let _ = write_tx_udp.send(Frame::Control(Message::NewConnection { tunnel_id, stream_id: sid, is_udp: true, peer_addr: Some(peer_addr) })).await;
+                                    sid
                                 };
                                 // Accumulate inbound bytes for the rate-computation task.
                                 if let Some(b) = peer_bytes_in.get(&stream_id) {
