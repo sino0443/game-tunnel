@@ -383,6 +383,27 @@ async fn run_server_task(
                 };
                 if !to_remove.is_empty() {
                     let mut st = state.write().await;
+
+                    // Close any open local streams for the tunnels on this server.
+                    // Dropping LocalStream.tx causes handle_local_stream's write_task
+                    // to exit (channel closed → write_task gets None → select exits),
+                    // which cleanly tears down the local TCP/UDP socket to the game
+                    // server.  Without this, the game server would see phantom player
+                    // connections (open sockets receiving no data) until the OS-level
+                    // idle timeout fires — potentially many minutes later.
+                    let tunnel_ids_on_server: std::collections::HashSet<u32> =
+                        to_remove.iter().map(|&(_, tid)| tid).collect();
+                    let stale_stream_ids: Vec<u64> = st
+                        .stream_tunnel
+                        .iter()
+                        .filter(|(_, &tid)| tunnel_ids_on_server.contains(&tid))
+                        .map(|(&sid, _)| sid)
+                        .collect();
+                    for sid in stale_stream_ids {
+                        st.streams.remove(&sid);      // drops LocalStream.tx
+                        st.stream_tunnel.remove(&sid);
+                    }
+
                     for (db_id, tunnel_id) in &to_remove {
                         if let Some(t) = st.tunnels.remove(db_id) {
                             st.tunnel_local_addrs.remove(&t.tunnel_id);
@@ -1052,7 +1073,7 @@ async fn handle_local_stream(
     let (mut lr, mut lw) = local.into_split();
     let servers_r = Arc::clone(&servers);
     let stats_r = stats.clone();
-    let read_task = tokio::spawn(async move {
+    let mut read_task = tokio::spawn(async move {
         let mut buf = vec![0u8; 65536];
         loop {
             match lr.read(&mut buf).await {
@@ -1069,12 +1090,21 @@ async fn handle_local_stream(
             }
         }
     });
-    let write_task = tokio::spawn(async move {
+    let mut write_task = tokio::spawn(async move {
         while let Some(data) = from_tunnel.recv().await {
             if lw.write_all(&data).await.is_err() { break; }
         }
     });
-    tokio::select! { _ = read_task => {} _ = write_task => {} }
+    tokio::select! { _ = &mut read_task => {} _ = &mut write_task => {} }
+    // Abort the task that is still running so both socket halves are closed
+    // immediately.  Without this the "loser" task stays alive holding its
+    // OwnedReadHalf (lr) or OwnedWriteHalf (lw), leaving the TCP connection
+    // in a half-open state.  Many game servers will not remove the player
+    // from their internal player list until the socket is fully closed — even
+    // though no data is flowing.  Aborting ensures both halves are dropped
+    // and the OS sends a FIN/RST so the game server detects the disconnect.
+    read_task.abort();
+    write_task.abort();
     let svrs = servers.read().await;
     if let Some(srv) = svrs.get(&server_id) {
         let _ = srv.write_tx.send(Frame::StreamClose { stream_id }).await;
@@ -1099,7 +1129,7 @@ async fn handle_local_udp_stream(
     let sr = Arc::clone(&socket);
     let servers_r = Arc::clone(&servers);
     let stats_r = stats.clone();
-    let read_task = tokio::spawn(async move {
+    let mut read_task = tokio::spawn(async move {
         let mut buf = vec![0u8; 65535];
         loop {
             match sr.recv(&mut buf).await {
@@ -1130,7 +1160,7 @@ async fn handle_local_udp_stream(
     // (Satisfactory, ARK) don't lose their session while the player is still
     // loading.  Bedrock and other games that don't send explicit disconnects
     // will have stale sessions cleaned up after 2 minutes instead of 35s.
-    let write_task = tokio::spawn(async move {
+    let mut write_task = tokio::spawn(async move {
         loop {
             match tokio::time::timeout(
                 tokio::time::Duration::from_secs(120),
@@ -1151,7 +1181,12 @@ async fn handle_local_udp_stream(
             }
         }
     });
-    tokio::select! { _ = read_task => {} _ = write_task => {} }
+    tokio::select! { _ = &mut read_task => {} _ = &mut write_task => {} }
+    // Abort whichever task is still running.  For UDP the socket is shared
+    // via Arc so aborting only drops the per-task clone, not the socket
+    // itself — the socket lives until handle_local_udp_stream returns.
+    read_task.abort();
+    write_task.abort();
     info!("UDP stream {}: closing", stream_id);
     let svrs = servers.read().await;
     if let Some(srv) = svrs.get(&server_id) {

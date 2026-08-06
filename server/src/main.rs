@@ -578,8 +578,18 @@ async fn handle_client(
                     }
                 }
                 Frame::StreamClose { stream_id } => {
-                    let mut st = state_clone.write().await;
-                    st.streams.remove(&stream_id); st.udp_peers.remove(&stream_id); st.stream_tunnel.remove(&stream_id);
+                    {
+                        let mut st = state_clone.write().await;
+                        st.streams.remove(&stream_id);
+                        st.udp_peers.remove(&stream_id);
+                        st.stream_tunnel.remove(&stream_id);
+                    }
+                    // Remove from the global registry so the web UI no longer shows this
+                    // connection as active.  For TCP streams handle_player_stream removes
+                    // itself when it exits; for UDP there is no per-peer task, so this
+                    // explicit removal is the only way to avoid a ~5-minute ghost window
+                    // caused by the stale UDP session-cleanup delay.
+                    registry_loop.write().await.remove(&stream_id);
                 }
             }
         }
@@ -715,6 +725,32 @@ async fn handle_control_message(
                         res = socket.recv_from(&mut buf) => { match res {
                             Ok((len, peer_addr)) => {
                                 last_seen.insert(peer_addr, std::time::Instant::now());
+
+                                // Stale-peer check: the client may have sent StreamClose (e.g.
+                                // on its 120 s inactivity timeout) for an entry that is still in
+                                // our local peer_streams map but whose udp_peers entry was
+                                // removed by handle_client.  Detect this now so that a player
+                                // who reconnects from the same IP:port is treated as a fresh
+                                // connection rather than silently having their data dropped
+                                // because it would be forwarded to an already-closed stream.
+                                if let Some(&sid) = peer_streams.get(&peer_addr) {
+                                    let still_active = {
+                                        let st = state_udp.read().await;
+                                        st.udp_peers.contains_key(&sid)
+                                    };
+                                    if !still_active {
+                                        info!(
+                                            "UDP: peer {} stream {} was closed by client — \
+                                             evicting stale mapping, will re-register on next packet",
+                                            peer_addr, sid
+                                        );
+                                        peer_streams.remove(&peer_addr);
+                                        last_seen.remove(&peer_addr);
+                                        peer_bytes_in.remove(&sid);
+                                        peer_bytes_out.remove(&sid);
+                                    }
+                                }
+
                                 let stream_id = if let Some(&sid) = peer_streams.get(&peer_addr) {
                                     sid
                                 } else {
@@ -905,11 +941,19 @@ async fn handle_player_stream(
         _ = &mut write_task => {}
         _ = kill_rx.changed() => {
             // Forced disconnect via DELETE /api/connections/{stream_id}.
-            // Abort both I/O tasks so the player socket is closed promptly.
             read_task.abort();
             write_task.abort();
         }
     }
+    // Abort whichever task is still running so both socket halves are
+    // closed immediately.  Without this the "loser" task keeps its
+    // OwnedReadHalf (pr) or OwnedWriteHalf (pw) alive, leaving the
+    // player's TCP connection half-open.  The player's game client will
+    // not detect the disconnect until it tries to write — which may not
+    // happen for a long time on a quiet connection — so the player stays
+    // on-screen in the game until the OS-level timeout fires.
+    read_task.abort();
+    write_task.abort();
     let _ = to_tunnel.send(Frame::StreamClose { stream_id }).await;
     let mut st = state.write().await;
     st.streams.remove(&stream_id);
