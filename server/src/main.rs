@@ -584,43 +584,18 @@ async fn handle_client(
 
     let (write_tx, mut write_rx) = mpsc::channel::<Frame>(8192);
     let writer_task = tokio::spawn(async move {
-        // Batch-write frames to reduce TLS flush overhead under load.
-        //
-        // Each individual flush is a syscall (and a separate TLS record).
-        // With many concurrent players the old one-frame-one-flush approach
-        // created N syscalls for N queued frames, which saturated the writer
-        // and caused the 8192-slot channel to back-pressure the main
-        // handle_client read loop — stalling ALL frame processing for that
-        // connection and appearing as player disconnects.
-        //
-        // Strategy: write the first frame without flushing, then drain up to
-        // 63 more immediately-available frames the same way, and finally flush
-        // once for the entire batch.  Frames are written in strict channel
-        // order so protocol correctness is preserved.  The batch cap (64) keeps
-        // worst-case latency per flush under ~1 ms even on a slow link.
-        'outer: while let Some(frame) = write_rx.recv().await {
+        // One frame per flush — matches the stable behaviour from PR #14.
+        // Batching (noflush + drain loop) was tried in PR #20 and reverted in
+        // PR #21 ("suspected cause of mass disconnects"), then re-introduced in
+        // PR #25 and confirmed again to cause post-join disconnects.  Keep the
+        // simple, previously-stable approach: write one frame, flush, repeat.
+        while let Some(frame) = write_rx.recv().await {
             let r = match &frame {
-                Frame::Control(msg)                     => protocol::write_control_noflush(&mut write_half, msg).await,
-                Frame::Data { stream_id, payload }      => protocol::write_data_noflush(&mut write_half, *stream_id, payload).await,
-                Frame::StreamClose { stream_id }        => protocol::write_stream_close_noflush(&mut write_half, *stream_id).await,
+                Frame::Control(msg)                     => protocol::write_control(&mut write_half, msg).await,
+                Frame::Data { stream_id, payload }      => protocol::write_data(&mut write_half, *stream_id, payload).await,
+                Frame::StreamClose { stream_id }        => protocol::write_stream_close(&mut write_half, *stream_id).await,
             };
             if r.is_err() { break; }
-            // Drain any frames that are already queued (non-blocking).
-            for _ in 0..63 {
-                match write_rx.try_recv() {
-                    Ok(more) => {
-                        let r = match &more {
-                            Frame::Control(msg)                => protocol::write_control_noflush(&mut write_half, msg).await,
-                            Frame::Data { stream_id, payload } => protocol::write_data_noflush(&mut write_half, *stream_id, payload).await,
-                            Frame::StreamClose { stream_id }   => protocol::write_stream_close_noflush(&mut write_half, *stream_id).await,
-                        };
-                        if r.is_err() { break 'outer; }
-                    }
-                    Err(_) => break, // no more frames queued — stop draining
-                }
-            }
-            // One flush for the whole batch.
-            if write_half.flush().await.is_err() { break; }
         }
     });
 

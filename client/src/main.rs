@@ -361,31 +361,14 @@ async fn run_server_task(
                 let (write_tx, mut write_rx) = mpsc::channel::<Frame>(8192);
                 let writer_task = tokio::spawn(async move {
                     let mut wh = write_half;
-                    // Batch-write frames to reduce TLS flush overhead under load.
-                    // See the matching comment in the server writer task for the
-                    // full rationale.  Same strategy: write first frame without
-                    // flushing, drain up to 63 more queued frames, flush once.
-                    'outer: while let Some(frame) = write_rx.recv().await {
+                    // One frame per flush — see matching comment in server writer task.
+                    while let Some(frame) = write_rx.recv().await {
                         let r = match &frame {
-                            Frame::Control(msg)                     => protocol::write_control_noflush(&mut wh, msg).await,
-                            Frame::Data { stream_id, payload }      => protocol::write_data_noflush(&mut wh, *stream_id, payload).await,
-                            Frame::StreamClose { stream_id }        => protocol::write_stream_close_noflush(&mut wh, *stream_id).await,
+                            Frame::Control(msg)                     => protocol::write_control(&mut wh, msg).await,
+                            Frame::Data { stream_id, payload }      => protocol::write_data(&mut wh, *stream_id, payload).await,
+                            Frame::StreamClose { stream_id }        => protocol::write_stream_close(&mut wh, *stream_id).await,
                         };
                         if r.is_err() { break; }
-                        for _ in 0..63 {
-                            match write_rx.try_recv() {
-                                Ok(more) => {
-                                    let r = match &more {
-                                        Frame::Control(msg)                => protocol::write_control_noflush(&mut wh, msg).await,
-                                        Frame::Data { stream_id, payload } => protocol::write_data_noflush(&mut wh, *stream_id, payload).await,
-                                        Frame::StreamClose { stream_id }   => protocol::write_stream_close_noflush(&mut wh, *stream_id).await,
-                                    };
-                                    if r.is_err() { break 'outer; }
-                                }
-                                Err(_) => break,
-                            }
-                        }
-                        if wh.flush().await.is_err() { break; }
                     }
                 });
 
