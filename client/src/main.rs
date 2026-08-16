@@ -846,6 +846,39 @@ async fn sync_tunnels(
     Ok(())
 }
 
+/// Reads a Minecraft VarInt; returns `(value, bytes_consumed)` or `None`.
+fn read_varint(data: &[u8], mut pos: usize) -> Option<(u32, usize)> {
+    let start = pos;
+    let mut result = 0u32;
+    let mut shift = 0u32;
+    loop {
+        if pos >= data.len() { return None; }
+        let b = data[pos]; pos += 1;
+        result |= ((b & 0x7F) as u32) << shift;
+        if b & 0x80 == 0 { break; }
+        shift += 7;
+        if shift >= 35 { return None; }
+    }
+    Some((result, pos - start))
+}
+
+/// Returns the `next_state` from a Minecraft Handshake packet (packet ID 0x00).
+/// `Some(1)` = Status (server-list ping), `Some(2)` = Login.
+/// `None` if the data is too short or not a Handshake.
+fn minecraft_next_state(data: &[u8]) -> Option<u32> {
+    let mut pos = 0;
+    let (_, n) = read_varint(data, pos)?; pos += n; // packet_length
+    let (id, n) = read_varint(data, pos)?; pos += n; // packet_id
+    if id != 0 { return None; }
+    let (_, n) = read_varint(data, pos)?; pos += n;  // protocol_version
+    let (alen, n) = read_varint(data, pos)?; pos += n; // server_address length
+    pos += alen as usize;                              // server_address bytes
+    if pos + 2 > data.len() { return None; }
+    pos += 2;                                          // server_port (u16)
+    let (next_state, _) = read_varint(data, pos)?;
+    Some(next_state)
+}
+
 /// Builds a Proxy Protocol v1 header string for the given peer address and
 /// local game server address.
 ///
@@ -1052,7 +1085,7 @@ async fn handle_control_message(
                     }
                 });
             } else {
-                let (tx, rx) = mpsc::channel::<Vec<u8>>(2048);
+                let (tx, mut rx) = mpsc::channel::<Vec<u8>>(2048);
                 { state_clone.write().await.streams.insert(stream_id, LocalStream { tx }); }
                 tokio::spawn(async move {
                     match TcpStream::connect(&local_addr).await {
@@ -1060,26 +1093,59 @@ async fn handle_control_message(
                             s.set_nodelay(true).ok();
                             apply_socket_options(&s);
 
-                            // Proxy Protocol v1: prepend the PROXY header so that the
-                            // backend (e.g. Velocity) sees the real player IP/port instead
-                            // of the loopback address.
-                            //
-                            // Format: "PROXY TCP4 <src_ip> <dst_ip> <src_port> <dst_port>\r\n"
-                            // We parse the local_addr to extract the server's IP and port.
-                            if use_proxy_protocol {
-                                let header = build_proxy_protocol_header(peer_addr, &local_addr);
-                                if let Err(e) = s.write_all(header.as_bytes()).await {
-                                    error!(
-                                        "Proxy Protocol header write failed (stream {}): {:?}",
-                                        stream_id, e
-                                    );
-                                    // Fall through — the connection will fail gracefully.
-                                } else {
-                                    info!(
-                                        "Proxy Protocol header sent for stream {} (peer={:?})",
-                                        stream_id, peer_addr
-                                    );
+                            // Read the first Minecraft packet (already queued in the
+                            // channel — the VPS forwards it within one tunnel RTT).
+                            let first_chunk = match rx.recv().await {
+                                Some(d) => d,
+                                None => {
+                                    { let t = stats_clone.tunnels.read().await; if let Some(ts) = t.get(&tunnel_id) { ts.active_connections.fetch_sub(1, Ordering::Relaxed); } }
+                                    let mut st = state_clone.write().await;
+                                    st.streams.remove(&stream_id);
+                                    st.stream_tunnel.remove(&stream_id);
+                                    let svrs = servers_clone.read().await;
+                                    if let Some(srv) = svrs.get(&server_id) { let _ = srv.write_tx.send(Frame::StreamClose { stream_id }).await; }
+                                    return;
                                 }
+                            };
+
+                            // Decide whether to prepend a PROXY Protocol header.
+                            //
+                            // STATUS CHECK (next_state = 1 — server-list ping):
+                            //   Omit the header entirely.  Velocity has a bug where the
+                            //   PROXY header on status-check connections causes the
+                            //   server-list to show "Pinging…" indefinitely (green bars
+                            //   never load).  Velocity falls through to normal Minecraft
+                            //   handling when no "PROXY " prefix is present, so skipping
+                            //   is safe and correct.  Status checks don't carry player IPs
+                            //   to bans/logs anyway.
+                            //
+                            // LOGIN (next_state = 2):
+                            //   Prepend the header AND concatenate it with first_chunk in a
+                            //   SINGLE write_all().  With TCP_NODELAY two separate writes
+                            //   produce two separate TCP segments; Velocity's Netty transport
+                            //   can race between the PROXY-header event and the Handshake
+                            //   event.  One combined segment → one Netty read event → no race.
+                            let is_status = use_proxy_protocol
+                                && minecraft_next_state(&first_chunk) == Some(1);
+
+                            let initial: Vec<u8> = if use_proxy_protocol && !is_status {
+                                let header = build_proxy_protocol_header(peer_addr, &local_addr);
+                                info!("Proxy Protocol header for stream {} (peer={:?})", stream_id, peer_addr);
+                                let mut v = header.into_bytes();
+                                v.extend_from_slice(&first_chunk);
+                                v
+                            } else {
+                                first_chunk // status check or proxy-protocol disabled: send as-is
+                            };
+
+                            if s.write_all(&initial).await.is_err() {
+                                { let t = stats_clone.tunnels.read().await; if let Some(ts) = t.get(&tunnel_id) { ts.active_connections.fetch_sub(1, Ordering::Relaxed); } }
+                                let mut st = state_clone.write().await;
+                                st.streams.remove(&stream_id);
+                                st.stream_tunnel.remove(&stream_id);
+                                let svrs = servers_clone.read().await;
+                                if let Some(srv) = svrs.get(&server_id) { let _ = srv.write_tx.send(Frame::StreamClose { stream_id }).await; }
+                                return;
                             }
 
                             handle_local_stream(s, stream_id, tunnel_id, server_id, rx, state_clone, servers_clone, stats_clone).await;
