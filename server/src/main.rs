@@ -26,15 +26,6 @@ static STREAM_ID_COUNTER: AtomicU64 = AtomicU64::new(1);
 static ACTIVE_CONNECTIONS: AtomicUsize = AtomicUsize::new(0);
 const MAX_CONNECTIONS: usize = 200;
 const CLIENT_IDLE_TIMEOUT_SECS: u64 = 120;
-/// Maximum time we wait for a single `write_all` to a player's TCP socket.
-///
-/// A player whose kernel TCP send-buffer stays full longer than this has
-/// effectively vanished from the network (silent drop, dead NAT, etc.).
-/// Without a timeout the write task blocks forever, keeping the
-/// `ConnRegistry` entry alive as a ghost connection visible in the web UI.
-/// 30 s is well above any realistic game client round-trip while still
-/// being short enough to recover the slot quickly after a hard disconnect.
-const PLAYER_WRITE_TIMEOUT_SECS: u64 = 30;
 /// UDP sessions are cleaned up after this period of inactivity.
 /// 300 s (5 minutes) gives games with long loading phases (Satisfactory,
 /// ARK, Valheim) enough time to finish loading a map without the tunnel
@@ -208,6 +199,19 @@ fn apply_socket_options(stream: &TcpStream) {
     }
     if let Err(e) = sock_ref.set_recv_buffer_size(SOCKET_BUF_SIZE) {
         warn!("Failed to set SO_RCVBUF: {:?}", e);
+    }
+    // TCP_USER_TIMEOUT: fail a write once un-ACKed data is older than 30 s.
+    //
+    // Unlike an application-level tokio::time::timeout on write_all(), this
+    // ONLY fires when the remote end has stopped acknowledging data — i.e.,
+    // the connection is genuinely dead (silent drop, crashed OS, dead NAT).
+    // A slow-but-alive connection where data is ACKed one packet at a time
+    // (e.g., a player with 1 Mbps download loading a large Minecraft world)
+    // will never trigger this timeout, so the world-loading disconnect bug is
+    // completely avoided while ghost connections are still cleaned up quickly.
+    #[cfg(target_os = "linux")]
+    if let Err(e) = sock_ref.set_tcp_user_timeout(Some(Duration::from_secs(30))) {
+        warn!("Failed to set TCP_USER_TIMEOUT: {:?}", e);
     }
 }
 
@@ -580,43 +584,18 @@ async fn handle_client(
 
     let (write_tx, mut write_rx) = mpsc::channel::<Frame>(8192);
     let writer_task = tokio::spawn(async move {
-        // Batch-write frames to reduce TLS flush overhead under load.
-        //
-        // Each individual flush is a syscall (and a separate TLS record).
-        // With many concurrent players the old one-frame-one-flush approach
-        // created N syscalls for N queued frames, which saturated the writer
-        // and caused the 8192-slot channel to back-pressure the main
-        // handle_client read loop — stalling ALL frame processing for that
-        // connection and appearing as player disconnects.
-        //
-        // Strategy: write the first frame without flushing, then drain up to
-        // 63 more immediately-available frames the same way, and finally flush
-        // once for the entire batch.  Frames are written in strict channel
-        // order so protocol correctness is preserved.  The batch cap (64) keeps
-        // worst-case latency per flush under ~1 ms even on a slow link.
-        'outer: while let Some(frame) = write_rx.recv().await {
+        // One frame per flush — matches the stable behaviour from PR #14.
+        // Batching (noflush + drain loop) was tried in PR #20 and reverted in
+        // PR #21 ("suspected cause of mass disconnects"), then re-introduced in
+        // PR #25 and confirmed again to cause post-join disconnects.  Keep the
+        // simple, previously-stable approach: write one frame, flush, repeat.
+        while let Some(frame) = write_rx.recv().await {
             let r = match &frame {
-                Frame::Control(msg)                     => protocol::write_control_noflush(&mut write_half, msg).await,
-                Frame::Data { stream_id, payload }      => protocol::write_data_noflush(&mut write_half, *stream_id, payload).await,
-                Frame::StreamClose { stream_id }        => protocol::write_stream_close_noflush(&mut write_half, *stream_id).await,
+                Frame::Control(msg)                     => protocol::write_control(&mut write_half, msg).await,
+                Frame::Data { stream_id, payload }      => protocol::write_data(&mut write_half, *stream_id, payload).await,
+                Frame::StreamClose { stream_id }        => protocol::write_stream_close(&mut write_half, *stream_id).await,
             };
             if r.is_err() { break; }
-            // Drain any frames that are already queued (non-blocking).
-            for _ in 0..63 {
-                match write_rx.try_recv() {
-                    Ok(more) => {
-                        let r = match &more {
-                            Frame::Control(msg)                => protocol::write_control_noflush(&mut write_half, msg).await,
-                            Frame::Data { stream_id, payload } => protocol::write_data_noflush(&mut write_half, *stream_id, payload).await,
-                            Frame::StreamClose { stream_id }   => protocol::write_stream_close_noflush(&mut write_half, *stream_id).await,
-                        };
-                        if r.is_err() { break 'outer; }
-                    }
-                    Err(_) => break, // no more frames queued — stop draining
-                }
-            }
-            // One flush for the whole batch.
-            if write_half.flush().await.is_err() { break; }
         }
     });
 
@@ -963,19 +942,13 @@ async fn handle_player_stream(
     let mut write_task = tokio::spawn(async move {
         while let Some(data) = from_tunnel.recv().await {
             bytes_out_c.fetch_add(data.len() as u64, Ordering::Relaxed);
-            // Enforce a hard write deadline.  If the player's TCP kernel
-            // send-buffer stays full for PLAYER_WRITE_TIMEOUT_SECS the
-            // connection is effectively dead (silent drop / NAT timeout /
-            // crashed client).  Without this deadline the task blocks here
-            // indefinitely, keeping the ConnRegistry entry alive as a ghost
-            // connection that the web UI keeps showing as "active".
-            match tokio::time::timeout(
-                tokio::time::Duration::from_secs(PLAYER_WRITE_TIMEOUT_SECS),
-                pw.write_all(&data),
-            ).await {
-                Ok(Ok(())) => {}
-                _ => break, // timeout or I/O error → trigger normal cleanup
-            }
+            // No application-level timeout here.  Ghost-connection detection is
+            // handled by TCP_USER_TIMEOUT set on the socket in apply_socket_options
+            // (Linux) or by TCP keep-alive on other platforms.  An app-level timeout
+            // here incorrectly disconnects legitimate players with slow connections
+            // during Minecraft world loading (many MB of chunk data) when their TCP
+            // receive window temporarily closes while the client processes geometry.
+            if pw.write_all(&data).await.is_err() { break; }
         }
     });
     tokio::select! {

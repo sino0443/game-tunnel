@@ -93,6 +93,13 @@ fn apply_socket_options(stream: &TcpStream) {
     if let Err(e) = sock_ref.set_recv_buffer_size(SOCKET_BUF_SIZE) {
         warn!("Failed to set SO_RCVBUF: {:?}", e);
     }
+    // See apply_socket_options in the server crate for the full rationale.
+    // Short version: TCP_USER_TIMEOUT detects dead connections without falsely
+    // disconnecting legitimate slow connections during world loading.
+    #[cfg(target_os = "linux")]
+    if let Err(e) = sock_ref.set_tcp_user_timeout(Some(Duration::from_secs(30))) {
+        warn!("Failed to set TCP_USER_TIMEOUT: {:?}", e);
+    }
 }
 
 fn apply_tunnel_socket_options(stream: &TcpStream) {
@@ -354,31 +361,14 @@ async fn run_server_task(
                 let (write_tx, mut write_rx) = mpsc::channel::<Frame>(8192);
                 let writer_task = tokio::spawn(async move {
                     let mut wh = write_half;
-                    // Batch-write frames to reduce TLS flush overhead under load.
-                    // See the matching comment in the server writer task for the
-                    // full rationale.  Same strategy: write first frame without
-                    // flushing, drain up to 63 more queued frames, flush once.
-                    'outer: while let Some(frame) = write_rx.recv().await {
+                    // One frame per flush — see matching comment in server writer task.
+                    while let Some(frame) = write_rx.recv().await {
                         let r = match &frame {
-                            Frame::Control(msg)                     => protocol::write_control_noflush(&mut wh, msg).await,
-                            Frame::Data { stream_id, payload }      => protocol::write_data_noflush(&mut wh, *stream_id, payload).await,
-                            Frame::StreamClose { stream_id }        => protocol::write_stream_close_noflush(&mut wh, *stream_id).await,
+                            Frame::Control(msg)                     => protocol::write_control(&mut wh, msg).await,
+                            Frame::Data { stream_id, payload }      => protocol::write_data(&mut wh, *stream_id, payload).await,
+                            Frame::StreamClose { stream_id }        => protocol::write_stream_close(&mut wh, *stream_id).await,
                         };
                         if r.is_err() { break; }
-                        for _ in 0..63 {
-                            match write_rx.try_recv() {
-                                Ok(more) => {
-                                    let r = match &more {
-                                        Frame::Control(msg)                => protocol::write_control_noflush(&mut wh, msg).await,
-                                        Frame::Data { stream_id, payload } => protocol::write_data_noflush(&mut wh, *stream_id, payload).await,
-                                        Frame::StreamClose { stream_id }   => protocol::write_stream_close_noflush(&mut wh, *stream_id).await,
-                                    };
-                                    if r.is_err() { break 'outer; }
-                                }
-                                Err(_) => break,
-                            }
-                        }
-                        if wh.flush().await.is_err() { break; }
                     }
                 });
 
@@ -1166,18 +1156,9 @@ async fn handle_local_stream(
     });
     let mut write_task = tokio::spawn(async move {
         while let Some(data) = from_tunnel.recv().await {
-            // Enforce a hard write deadline.  If the local game server's TCP
-            // send-buffer stays full for 30 seconds the connection is
-            // effectively stalled (crashed server, OS buffer exhaustion).
-            // Without this timeout the task blocks here indefinitely, keeping
-            // the stream alive as a ghost entry — preventing proper cleanup.
-            match tokio::time::timeout(
-                tokio::time::Duration::from_secs(30),
-                lw.write_all(&data),
-            ).await {
-                Ok(Ok(())) => {}
-                _ => break, // timeout or I/O error → trigger normal cleanup
-            }
+            // No application-level timeout — TCP_USER_TIMEOUT on the socket
+            // handles dead local connections on Linux.  See apply_socket_options.
+            if lw.write_all(&data).await.is_err() { break; }
         }
     });
     tokio::select! { _ = &mut read_task => {} _ = &mut write_task => {} }
