@@ -861,55 +861,35 @@ async fn sync_tunnels(
     Ok(())
 }
 
-/// Reads a Minecraft VarInt from `data` starting at `pos`.
-/// Returns `(value, bytes_consumed)` or `None` if the data is too short.
+/// Reads a Minecraft VarInt; returns `(value, bytes_consumed)` or `None`.
 fn read_varint(data: &[u8], mut pos: usize) -> Option<(u32, usize)> {
     let start = pos;
     let mut result = 0u32;
     let mut shift = 0u32;
     loop {
         if pos >= data.len() { return None; }
-        let b = data[pos];
-        pos += 1;
+        let b = data[pos]; pos += 1;
         result |= ((b & 0x7F) as u32) << shift;
         if b & 0x80 == 0 { break; }
         shift += 7;
-        if shift >= 35 { return None; } // VarInt too large (not valid MC)
+        if shift >= 35 { return None; }
     }
     Some((result, pos - start))
 }
 
-/// Extracts the `next_state` field from the first bytes of a Minecraft
-/// Handshake packet (packet ID 0x00):
-///
-/// ```text
-/// VarInt  packet_length
-/// VarInt  packet_id       (must be 0)
-/// VarInt  protocol_version
-/// String  server_address  (VarInt length + UTF-8 bytes)
-/// u16     server_port     (big-endian)
-/// VarInt  next_state      ← 1 = Status, 2 = Login
-/// ```
-///
-/// Returns `Some(1)` for a status-check (server-list ping) connection,
-/// `Some(2)` for a login/game connection, or `None` if the data is too short
-/// or does not look like a Minecraft Handshake.
+/// Returns the `next_state` from a Minecraft Handshake packet (packet ID 0x00).
+/// `Some(1)` = Status (server-list ping), `Some(2)` = Login.
+/// `None` if the data is too short or not a Handshake.
 fn minecraft_next_state(data: &[u8]) -> Option<u32> {
     let mut pos = 0;
-    // Packet length
-    let (_, n) = read_varint(data, pos)?; pos += n;
-    // Packet ID — must be 0x00 for Handshake
-    let (id, n) = read_varint(data, pos)?; pos += n;
+    let (_, n) = read_varint(data, pos)?; pos += n; // packet_length
+    let (id, n) = read_varint(data, pos)?; pos += n; // packet_id
     if id != 0 { return None; }
-    // Protocol version
-    let (_, n) = read_varint(data, pos)?; pos += n;
-    // Server address (VarString: length + bytes)
-    let (addr_len, n) = read_varint(data, pos)?; pos += n;
-    pos += addr_len as usize;
-    // Server port (u16 big-endian)
+    let (_, n) = read_varint(data, pos)?; pos += n;  // protocol_version
+    let (alen, n) = read_varint(data, pos)?; pos += n; // server_address length
+    pos += alen as usize;                              // server_address bytes
     if pos + 2 > data.len() { return None; }
-    pos += 2;
-    // next_state
+    pos += 2;                                          // server_port (u16)
     let (next_state, _) = read_varint(data, pos)?;
     Some(next_state)
 }
@@ -1128,28 +1108,11 @@ async fn handle_control_message(
                             s.set_nodelay(true).ok();
                             apply_socket_options(&s);
 
-                            // Read the first data chunk so we can inspect next_state
-                            // before deciding whether to prepend a PROXY Protocol header.
-                            //
-                            // We connect to Velocity FIRST (same timing as before) so
-                            // there is no extra latency in the connection setup.  Then we
-                            // wait for the first Minecraft packet — it is almost always
-                            // already queued in the channel because the VPS forwards
-                            // the player's data within a single RTT of accepting the
-                            // TCP connection.
-                            //
-                            // We skip the PROXY header for STATUS CHECK connections
-                            // (next_state = 1).  Velocity 4.x has a race condition in
-                            // its status-check pipeline when the PROXY header is present,
-                            // causing intermittent "Pinging…" with no signal bars.
-                            // Status checks don't need the real player IP — there is no
-                            // ban check or player session to track — so omitting the
-                            // header is harmless and eliminates the instability.
+                            // Read the first Minecraft packet (already queued in the
+                            // channel — the VPS forwards it within one tunnel RTT).
                             let first_chunk = match rx.recv().await {
                                 Some(d) => d,
                                 None => {
-                                    // Channel closed — tunnel was torn down before any data
-                                    // arrived.  Clean up the stream entry.
                                     { let t = stats_clone.tunnels.read().await; if let Some(ts) = t.get(&tunnel_id) { ts.active_connections.fetch_sub(1, Ordering::Relaxed); } }
                                     let mut st = state_clone.write().await;
                                     st.streams.remove(&stream_id);
@@ -1159,26 +1122,38 @@ async fn handle_control_message(
                                     return;
                                 }
                             };
-                            let is_status_check = minecraft_next_state(&first_chunk) == Some(1);
 
-                            if use_proxy_protocol && !is_status_check {
+                            // Decide whether to prepend a PROXY Protocol header.
+                            //
+                            // STATUS CHECK (next_state = 1 — server-list ping):
+                            //   Omit the header entirely.  Velocity 4.x has a bug where
+                            //   the PROXY header triggers instability in its status-check
+                            //   pipeline, leaving the signal bars at "Pinging…".  Velocity
+                            //   falls through to normal Minecraft handling when no "PROXY "
+                            //   magic prefix is found, so skipping is safe and correct.
+                            //   Status checks don't expose player IPs to bans/logs anyway.
+                            //
+                            // LOGIN (next_state = 2):
+                            //   Prepend the header AND concatenate it with first_chunk in a
+                            //   SINGLE write_all().  With TCP_NODELAY, two separate writes
+                            //   produce two separate TCP segments; Velocity's Netty transport
+                            //   can then race between the PROXY-header event and the
+                            //   Handshake event.  One combined segment → one Netty event →
+                            //   no race.
+                            let is_status = use_proxy_protocol
+                                && minecraft_next_state(&first_chunk) == Some(1);
+
+                            let initial: Vec<u8> = if use_proxy_protocol && !is_status {
                                 let header = build_proxy_protocol_header(peer_addr, &local_addr);
-                                if let Err(e) = s.write_all(header.as_bytes()).await {
-                                    error!(
-                                        "Proxy Protocol header write failed (stream {}): {:?}",
-                                        stream_id, e
-                                    );
-                                    // Fall through — the connection will fail gracefully.
-                                } else {
-                                    info!(
-                                        "Proxy Protocol header sent for stream {} (peer={:?})",
-                                        stream_id, peer_addr
-                                    );
-                                }
-                            }
+                                info!("Proxy Protocol header for stream {} (peer={:?})", stream_id, peer_addr);
+                                let mut v = header.into_bytes();
+                                v.extend_from_slice(&first_chunk);
+                                v
+                            } else {
+                                first_chunk // status check or no proxy-protocol: send as-is
+                            };
 
-                            // Forward the first chunk (Minecraft Handshake + possibly more).
-                            if s.write_all(&first_chunk).await.is_err() {
+                            if s.write_all(&initial).await.is_err() {
                                 { let t = stats_clone.tunnels.read().await; if let Some(ts) = t.get(&tunnel_id) { ts.active_connections.fetch_sub(1, Ordering::Relaxed); } }
                                 let mut st = state_clone.write().await;
                                 st.streams.remove(&stream_id);
