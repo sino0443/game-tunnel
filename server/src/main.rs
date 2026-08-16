@@ -41,10 +41,19 @@ const PLAYER_WRITE_TIMEOUT_SECS: u64 = 30;
 /// server dropping the session mid-load.  Bedrock and other fast games
 /// are unaffected — their stale sessions just linger a bit longer.
 const UDP_SESSION_TIMEOUT_SECS: u64 = 300;
-/// Socket send/receive buffer size for game connections.
+/// Socket send/receive buffer size for individual player game connections.
 /// 256 KB is large enough for most game update bursts while keeping
 /// per-connection overhead low.
 const SOCKET_BUF_SIZE: usize = 256 * 1024;
+/// Socket send/receive buffer size for the main tunnel TLS connection.
+///
+/// The tunnel socket multiplexes *all* players on a single TCP stream.
+/// At 500 Mbps with a 30 ms VPS↔home RTT, the bandwidth-delay product is
+/// ~1.8 MB — a 256 KB buffer causes TCP to stall and adds variable latency
+/// that shows up as intermittent "Pinging…" failures in the Minecraft server
+/// list (the Ping/Pong measurement times out if the tunnel stalls for >~2 s).
+/// 2 MB gives comfortable headroom for typical home-server upload speeds.
+const TUNNEL_SOCKET_BUF_SIZE: usize = 2 * 1024 * 1024;
 /// Send/receive buffer size for tunnel UDP sockets. Each UDP socket here
 /// multiplexes *every* player on that tunnel port, so it needs a much
 /// bigger cushion than a single TCP connection's buffer to avoid kernel-side
@@ -199,6 +208,31 @@ fn apply_socket_options(stream: &TcpStream) {
     }
     if let Err(e) = sock_ref.set_recv_buffer_size(SOCKET_BUF_SIZE) {
         warn!("Failed to set SO_RCVBUF: {:?}", e);
+    }
+}
+
+/// Socket options for the main tunnel TLS connection from a game-tunnel client.
+///
+/// Uses TUNNEL_SOCKET_BUF_SIZE (2 MB) instead of the per-player 256 KB because
+/// this socket carries every player's traffic multiplexed.  A small buffer here
+/// causes TCP stalls under load that manifest as extra latency in the forwarding
+/// path — most visibly as intermittent "Pinging…" failures in Minecraft's server
+/// list where the Ping/Pong exchange has a hard timeout of a few seconds.
+fn apply_tunnel_socket_options(stream: &TcpStream) {
+    use std::time::Duration;
+    let sock_ref = socket2::SockRef::from(stream);
+    let keepalive = socket2::TcpKeepalive::new()
+        .with_time(Duration::from_secs(10))
+        .with_interval(Duration::from_secs(5))
+        .with_retries(3);
+    if let Err(e) = sock_ref.set_tcp_keepalive(&keepalive) {
+        warn!("Failed to set tunnel TCP keepalive: {:?}", e);
+    }
+    if let Err(e) = sock_ref.set_send_buffer_size(TUNNEL_SOCKET_BUF_SIZE) {
+        warn!("Failed to set tunnel SO_SNDBUF: {:?}", e);
+    }
+    if let Err(e) = sock_ref.set_recv_buffer_size(TUNNEL_SOCKET_BUF_SIZE) {
+        warn!("Failed to set tunnel SO_RCVBUF: {:?}", e);
     }
 }
 
@@ -381,7 +415,9 @@ async fn main() -> Result<()> {
     loop {
         let (tcp_stream, addr) = listener.accept().await?;
         tcp_stream.set_nodelay(true).ok();
-        apply_socket_options(&tcp_stream);
+        // Use the larger tunnel socket options — this connection multiplexes
+        // all players and benefits from 2 MB buffers instead of per-player 256 KB.
+        apply_tunnel_socket_options(&tcp_stream);
 
         let conn_count = ACTIVE_CONNECTIONS.fetch_add(1, Ordering::Relaxed);
         if conn_count >= MAX_CONNECTIONS {
@@ -454,7 +490,18 @@ async fn handle_client(
     pre_auth_cache: PreAuthCache,
     registry: ConnRegistry,
 ) -> Result<()> {
-    let (mut read_half, mut write_half) = tokio::io::split(stream);
+    let (read_half, mut write_half) = tokio::io::split(stream);
+    // Wrap the read half in a 64 KB userspace buffer.
+    //
+    // protocol::read_frame issues three small reads per frame (4 B length +
+    // 8 B stream_id + payload).  Without buffering, each of those hits the
+    // TLS layer and can trigger a separate record decryption + syscall.  With
+    // a BufReader, a single fill grabs a large chunk from TLS (often one full
+    // record containing multiple batched frames from the client), and all
+    // subsequent header reads are served from memory.  This is especially
+    // important for the Minecraft Ping/Pong path: lower read latency keeps the
+    // total round-trip well below Minecraft's ~5 s server-list timeout.
+    let mut read_half = tokio::io::BufReader::with_capacity(65536, read_half);
 
     let frame = match tokio::time::timeout(tokio::time::Duration::from_secs(10), protocol::read_frame(&mut read_half)).await {
         Ok(Ok(f)) => f,

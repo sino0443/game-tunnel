@@ -71,7 +71,11 @@ fn load_tls_config(ca_path: &str) -> Result<Arc<rustls::ClientConfig>> {
     Ok(Arc::new(rustls::ClientConfig::builder().with_root_certificates(root_store).with_no_client_auth()))
 }
 
+/// Socket buffer size for local game-server connections (per-stream).
 const SOCKET_BUF_SIZE: usize = 256 * 1024;
+/// Socket buffer size for the main TLS tunnel connection to the VPS server.
+/// See the matching constant in the server crate for the full rationale.
+const TUNNEL_SOCKET_BUF_SIZE: usize = 2 * 1024 * 1024;
 
 fn apply_socket_options(stream: &TcpStream) {
     use std::time::Duration;
@@ -91,6 +95,24 @@ fn apply_socket_options(stream: &TcpStream) {
     }
 }
 
+fn apply_tunnel_socket_options(stream: &TcpStream) {
+    use std::time::Duration;
+    let sock_ref = socket2::SockRef::from(stream);
+    let keepalive = socket2::TcpKeepalive::new()
+        .with_time(Duration::from_secs(10))
+        .with_interval(Duration::from_secs(5))
+        .with_retries(3);
+    if let Err(e) = sock_ref.set_tcp_keepalive(&keepalive) {
+        warn!("Failed to set tunnel TCP keepalive: {:?}", e);
+    }
+    if let Err(e) = sock_ref.set_send_buffer_size(TUNNEL_SOCKET_BUF_SIZE) {
+        warn!("Failed to set tunnel SO_SNDBUF: {:?}", e);
+    }
+    if let Err(e) = sock_ref.set_recv_buffer_size(TUNNEL_SOCKET_BUF_SIZE) {
+        warn!("Failed to set tunnel SO_RCVBUF: {:?}", e);
+    }
+}
+
 /// Connects to a game-tunnel server, authenticates, and returns the TLS stream halves.
 /// Sends the client's UUID in the Auth message so the server can verify it against
 /// the pre-auth cache populated by the manager.
@@ -107,7 +129,7 @@ async fn connect_to_server(
     let tcp = TcpStream::connect(&entry.address).await
         .with_context(|| format!("failed to connect to {}", entry.address))?;
     tcp.set_nodelay(true)?;
-    apply_socket_options(&tcp);
+    apply_tunnel_socket_options(&tcp);
     let server_name = rustls::pki_types::ServerName::try_from("game-tunnel")
         .context("invalid server name")?;
     let tls = connector.connect(server_name, tcp).await.context("TLS handshake failed")?;
@@ -364,7 +386,10 @@ async fn run_server_task(
                     id: entry.id, name: entry.name.clone(), write_tx,
                 });
 
-                let mut rh = read_half;
+                // Wrap with a 64 KB userspace buffer — same reasoning as on
+                // the server side: reduces TLS record decryptions for small
+                // frame-header reads and lowers forwarding latency.
+                let mut rh = tokio::io::BufReader::with_capacity(65536, read_half);
                 let idle_timeout = tokio::time::Duration::from_secs(SERVER_IDLE_TIMEOUT_SECS);
                 loop {
                     let frame = match tokio::time::timeout(idle_timeout, protocol::read_frame(&mut rh)).await {
