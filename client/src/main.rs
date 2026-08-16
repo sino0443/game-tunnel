@@ -71,11 +71,7 @@ fn load_tls_config(ca_path: &str) -> Result<Arc<rustls::ClientConfig>> {
     Ok(Arc::new(rustls::ClientConfig::builder().with_root_certificates(root_store).with_no_client_auth()))
 }
 
-/// Socket buffer size for local game-server connections (per-stream).
 const SOCKET_BUF_SIZE: usize = 256 * 1024;
-/// Socket buffer size for the main TLS tunnel connection to the VPS server.
-/// See the matching constant in the server crate for the full rationale.
-const TUNNEL_SOCKET_BUF_SIZE: usize = 2 * 1024 * 1024;
 
 fn apply_socket_options(stream: &TcpStream) {
     use std::time::Duration;
@@ -92,31 +88,6 @@ fn apply_socket_options(stream: &TcpStream) {
     }
     if let Err(e) = sock_ref.set_recv_buffer_size(SOCKET_BUF_SIZE) {
         warn!("Failed to set SO_RCVBUF: {:?}", e);
-    }
-    // See apply_socket_options in the server crate for the full rationale.
-    // Short version: TCP_USER_TIMEOUT detects dead connections without falsely
-    // disconnecting legitimate slow connections during world loading.
-    #[cfg(target_os = "linux")]
-    if let Err(e) = sock_ref.set_tcp_user_timeout(Some(Duration::from_secs(30))) {
-        warn!("Failed to set TCP_USER_TIMEOUT: {:?}", e);
-    }
-}
-
-fn apply_tunnel_socket_options(stream: &TcpStream) {
-    use std::time::Duration;
-    let sock_ref = socket2::SockRef::from(stream);
-    let keepalive = socket2::TcpKeepalive::new()
-        .with_time(Duration::from_secs(10))
-        .with_interval(Duration::from_secs(5))
-        .with_retries(3);
-    if let Err(e) = sock_ref.set_tcp_keepalive(&keepalive) {
-        warn!("Failed to set tunnel TCP keepalive: {:?}", e);
-    }
-    if let Err(e) = sock_ref.set_send_buffer_size(TUNNEL_SOCKET_BUF_SIZE) {
-        warn!("Failed to set tunnel SO_SNDBUF: {:?}", e);
-    }
-    if let Err(e) = sock_ref.set_recv_buffer_size(TUNNEL_SOCKET_BUF_SIZE) {
-        warn!("Failed to set tunnel SO_RCVBUF: {:?}", e);
     }
 }
 
@@ -136,7 +107,7 @@ async fn connect_to_server(
     let tcp = TcpStream::connect(&entry.address).await
         .with_context(|| format!("failed to connect to {}", entry.address))?;
     tcp.set_nodelay(true)?;
-    apply_tunnel_socket_options(&tcp);
+    apply_socket_options(&tcp);
     let server_name = rustls::pki_types::ServerName::try_from("game-tunnel")
         .context("invalid server name")?;
     let tls = connector.connect(server_name, tcp).await.context("TLS handshake failed")?;
@@ -361,14 +332,31 @@ async fn run_server_task(
                 let (write_tx, mut write_rx) = mpsc::channel::<Frame>(8192);
                 let writer_task = tokio::spawn(async move {
                     let mut wh = write_half;
-                    // One frame per flush — see matching comment in server writer task.
-                    while let Some(frame) = write_rx.recv().await {
+                    // Batch-write frames to reduce TLS flush overhead under load.
+                    // See the matching comment in the server writer task for the
+                    // full rationale.  Same strategy: write first frame without
+                    // flushing, drain up to 63 more queued frames, flush once.
+                    'outer: while let Some(frame) = write_rx.recv().await {
                         let r = match &frame {
-                            Frame::Control(msg)                     => protocol::write_control(&mut wh, msg).await,
-                            Frame::Data { stream_id, payload }      => protocol::write_data(&mut wh, *stream_id, payload).await,
-                            Frame::StreamClose { stream_id }        => protocol::write_stream_close(&mut wh, *stream_id).await,
+                            Frame::Control(msg)                     => protocol::write_control_noflush(&mut wh, msg).await,
+                            Frame::Data { stream_id, payload }      => protocol::write_data_noflush(&mut wh, *stream_id, payload).await,
+                            Frame::StreamClose { stream_id }        => protocol::write_stream_close_noflush(&mut wh, *stream_id).await,
                         };
                         if r.is_err() { break; }
+                        for _ in 0..63 {
+                            match write_rx.try_recv() {
+                                Ok(more) => {
+                                    let r = match &more {
+                                        Frame::Control(msg)                => protocol::write_control_noflush(&mut wh, msg).await,
+                                        Frame::Data { stream_id, payload } => protocol::write_data_noflush(&mut wh, *stream_id, payload).await,
+                                        Frame::StreamClose { stream_id }   => protocol::write_stream_close_noflush(&mut wh, *stream_id).await,
+                                    };
+                                    if r.is_err() { break 'outer; }
+                                }
+                                Err(_) => break,
+                            }
+                        }
+                        if wh.flush().await.is_err() { break; }
                     }
                 });
 
@@ -376,10 +364,7 @@ async fn run_server_task(
                     id: entry.id, name: entry.name.clone(), write_tx,
                 });
 
-                // Wrap with a 64 KB userspace buffer — same reasoning as on
-                // the server side: reduces TLS record decryptions for small
-                // frame-header reads and lowers forwarding latency.
-                let mut rh = tokio::io::BufReader::with_capacity(65536, read_half);
+                let mut rh = read_half;
                 let idle_timeout = tokio::time::Duration::from_secs(SERVER_IDLE_TIMEOUT_SECS);
                 loop {
                     let frame = match tokio::time::timeout(idle_timeout, protocol::read_frame(&mut rh)).await {
@@ -861,39 +846,6 @@ async fn sync_tunnels(
     Ok(())
 }
 
-/// Reads a Minecraft VarInt; returns `(value, bytes_consumed)` or `None`.
-fn read_varint(data: &[u8], mut pos: usize) -> Option<(u32, usize)> {
-    let start = pos;
-    let mut result = 0u32;
-    let mut shift = 0u32;
-    loop {
-        if pos >= data.len() { return None; }
-        let b = data[pos]; pos += 1;
-        result |= ((b & 0x7F) as u32) << shift;
-        if b & 0x80 == 0 { break; }
-        shift += 7;
-        if shift >= 35 { return None; }
-    }
-    Some((result, pos - start))
-}
-
-/// Returns the `next_state` from a Minecraft Handshake packet (packet ID 0x00).
-/// `Some(1)` = Status (server-list ping), `Some(2)` = Login.
-/// `None` if the data is too short or not a Handshake.
-fn minecraft_next_state(data: &[u8]) -> Option<u32> {
-    let mut pos = 0;
-    let (_, n) = read_varint(data, pos)?; pos += n; // packet_length
-    let (id, n) = read_varint(data, pos)?; pos += n; // packet_id
-    if id != 0 { return None; }
-    let (_, n) = read_varint(data, pos)?; pos += n;  // protocol_version
-    let (alen, n) = read_varint(data, pos)?; pos += n; // server_address length
-    pos += alen as usize;                              // server_address bytes
-    if pos + 2 > data.len() { return None; }
-    pos += 2;                                          // server_port (u16)
-    let (next_state, _) = read_varint(data, pos)?;
-    Some(next_state)
-}
-
 /// Builds a Proxy Protocol v1 header string for the given peer address and
 /// local game server address.
 ///
@@ -1100,7 +1052,7 @@ async fn handle_control_message(
                     }
                 });
             } else {
-                let (tx, mut rx) = mpsc::channel::<Vec<u8>>(2048);
+                let (tx, rx) = mpsc::channel::<Vec<u8>>(2048);
                 { state_clone.write().await.streams.insert(stream_id, LocalStream { tx }); }
                 tokio::spawn(async move {
                     match TcpStream::connect(&local_addr).await {
@@ -1108,59 +1060,26 @@ async fn handle_control_message(
                             s.set_nodelay(true).ok();
                             apply_socket_options(&s);
 
-                            // Read the first Minecraft packet (already queued in the
-                            // channel — the VPS forwards it within one tunnel RTT).
-                            let first_chunk = match rx.recv().await {
-                                Some(d) => d,
-                                None => {
-                                    { let t = stats_clone.tunnels.read().await; if let Some(ts) = t.get(&tunnel_id) { ts.active_connections.fetch_sub(1, Ordering::Relaxed); } }
-                                    let mut st = state_clone.write().await;
-                                    st.streams.remove(&stream_id);
-                                    st.stream_tunnel.remove(&stream_id);
-                                    let svrs = servers_clone.read().await;
-                                    if let Some(srv) = svrs.get(&server_id) { let _ = srv.write_tx.send(Frame::StreamClose { stream_id }).await; }
-                                    return;
-                                }
-                            };
-
-                            // Decide whether to prepend a PROXY Protocol header.
+                            // Proxy Protocol v1: prepend the PROXY header so that the
+                            // backend (e.g. Velocity) sees the real player IP/port instead
+                            // of the loopback address.
                             //
-                            // STATUS CHECK (next_state = 1 — server-list ping):
-                            //   Omit the header entirely.  Velocity 4.x has a bug where
-                            //   the PROXY header triggers instability in its status-check
-                            //   pipeline, leaving the signal bars at "Pinging…".  Velocity
-                            //   falls through to normal Minecraft handling when no "PROXY "
-                            //   magic prefix is found, so skipping is safe and correct.
-                            //   Status checks don't expose player IPs to bans/logs anyway.
-                            //
-                            // LOGIN (next_state = 2):
-                            //   Prepend the header AND concatenate it with first_chunk in a
-                            //   SINGLE write_all().  With TCP_NODELAY, two separate writes
-                            //   produce two separate TCP segments; Velocity's Netty transport
-                            //   can then race between the PROXY-header event and the
-                            //   Handshake event.  One combined segment → one Netty event →
-                            //   no race.
-                            let is_status = use_proxy_protocol
-                                && minecraft_next_state(&first_chunk) == Some(1);
-
-                            let initial: Vec<u8> = if use_proxy_protocol && !is_status {
+                            // Format: "PROXY TCP4 <src_ip> <dst_ip> <src_port> <dst_port>\r\n"
+                            // We parse the local_addr to extract the server's IP and port.
+                            if use_proxy_protocol {
                                 let header = build_proxy_protocol_header(peer_addr, &local_addr);
-                                info!("Proxy Protocol header for stream {} (peer={:?})", stream_id, peer_addr);
-                                let mut v = header.into_bytes();
-                                v.extend_from_slice(&first_chunk);
-                                v
-                            } else {
-                                first_chunk // status check or no proxy-protocol: send as-is
-                            };
-
-                            if s.write_all(&initial).await.is_err() {
-                                { let t = stats_clone.tunnels.read().await; if let Some(ts) = t.get(&tunnel_id) { ts.active_connections.fetch_sub(1, Ordering::Relaxed); } }
-                                let mut st = state_clone.write().await;
-                                st.streams.remove(&stream_id);
-                                st.stream_tunnel.remove(&stream_id);
-                                let svrs = servers_clone.read().await;
-                                if let Some(srv) = svrs.get(&server_id) { let _ = srv.write_tx.send(Frame::StreamClose { stream_id }).await; }
-                                return;
+                                if let Err(e) = s.write_all(header.as_bytes()).await {
+                                    error!(
+                                        "Proxy Protocol header write failed (stream {}): {:?}",
+                                        stream_id, e
+                                    );
+                                    // Fall through — the connection will fail gracefully.
+                                } else {
+                                    info!(
+                                        "Proxy Protocol header sent for stream {} (peer={:?})",
+                                        stream_id, peer_addr
+                                    );
+                                }
                             }
 
                             handle_local_stream(s, stream_id, tunnel_id, server_id, rx, state_clone, servers_clone, stats_clone).await;
@@ -1222,9 +1141,18 @@ async fn handle_local_stream(
     });
     let mut write_task = tokio::spawn(async move {
         while let Some(data) = from_tunnel.recv().await {
-            // No application-level timeout — TCP_USER_TIMEOUT on the socket
-            // handles dead local connections on Linux.  See apply_socket_options.
-            if lw.write_all(&data).await.is_err() { break; }
+            // Enforce a hard write deadline.  If the local game server's TCP
+            // send-buffer stays full for 30 seconds the connection is
+            // effectively stalled (crashed server, OS buffer exhaustion).
+            // Without this timeout the task blocks here indefinitely, keeping
+            // the stream alive as a ghost entry — preventing proper cleanup.
+            match tokio::time::timeout(
+                tokio::time::Duration::from_secs(30),
+                lw.write_all(&data),
+            ).await {
+                Ok(Ok(())) => {}
+                _ => break, // timeout or I/O error → trigger normal cleanup
+            }
         }
     });
     tokio::select! { _ = &mut read_task => {} _ = &mut write_task => {} }
