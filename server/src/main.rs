@@ -673,34 +673,41 @@ async fn handle_control_message(
                                 apply_socket_options(&player_stream);
                                 let stream_id = STREAM_ID_COUNTER.fetch_add(1, Ordering::Relaxed);
                                 debug!("Player {} connected (stream {} TCP)", peer, stream_id);
-                                let (player_tx, player_rx) = mpsc::channel::<Vec<u8>>(2048);
-                                { let mut st = state_tcp.write().await; st.streams.insert(stream_id, PlayerStream { tx: player_tx }); st.stream_tunnel.insert(stream_id, tunnel_id); }
-                                let _ = write_tx_tcp.send(Frame::Control(Message::NewConnection { tunnel_id, stream_id, is_udp: false, peer_addr: Some(peer) })).await;
 
-                                // Register this connection in the global registry so the
-                                // manager can see it via GET /api/connections.
-                                let db_id_val = state_tcp.read().await.tunnels.get(&tunnel_id).map(|t| t.db_id).unwrap_or(0);
-                                let bytes_in     = Arc::new(AtomicU64::new(0));
-                                let bytes_out    = Arc::new(AtomicU64::new(0));
-                                let bytes_in_ps  = Arc::new(AtomicU64::new(0));
-                                let bytes_out_ps = Arc::new(AtomicU64::new(0));
-                                let (kill_tx, kill_rx) = watch::channel(false);
-                                registry_tcp.write().await.insert(stream_id, ConnRecord {
-                                    db_id:             db_id_val,
-                                    tunnel_id,
-                                    peer_ip:           peer.ip().to_string(),
-                                    bytes_in:          Arc::clone(&bytes_in),
-                                    bytes_out:         Arc::clone(&bytes_out),
-                                    bytes_in_per_sec:  Arc::clone(&bytes_in_ps),
-                                    bytes_out_per_sec: Arc::clone(&bytes_out_ps),
-                                    connected_at:      Instant::now(),
-                                    kill_tx,
-                                });
-
+                                // Spawn a separate task for the per-connection setup so the
+                                // listener loop can call accept() again immediately.  Without
+                                // this, every async operation below (channel send, lock, …)
+                                // blocks accept(), causing subsequent TCP connections — e.g.
+                                // simultaneous Minecraft server-list status pings — to pile up
+                                // in the OS backlog.  The Minecraft client times out waiting
+                                // for a status response and the green ping bar never appears.
                                 let wtx = write_tx_tcp.clone();
                                 let st  = Arc::clone(&state_tcp);
                                 let reg = Arc::clone(&registry_tcp);
                                 tokio::spawn(async move {
+                                    let (player_tx, player_rx) = mpsc::channel::<Vec<u8>>(2048);
+                                    { let mut s = st.write().await; s.streams.insert(stream_id, PlayerStream { tx: player_tx }); s.stream_tunnel.insert(stream_id, tunnel_id); }
+                                    let _ = wtx.send(Frame::Control(Message::NewConnection { tunnel_id, stream_id, is_udp: false, peer_addr: Some(peer) })).await;
+
+                                    // Register this connection in the global registry so the
+                                    // manager can see it via GET /api/connections.
+                                    let db_id_val = st.read().await.tunnels.get(&tunnel_id).map(|t| t.db_id).unwrap_or(0);
+                                    let bytes_in     = Arc::new(AtomicU64::new(0));
+                                    let bytes_out    = Arc::new(AtomicU64::new(0));
+                                    let bytes_in_ps  = Arc::new(AtomicU64::new(0));
+                                    let bytes_out_ps = Arc::new(AtomicU64::new(0));
+                                    let (kill_tx, kill_rx) = watch::channel(false);
+                                    reg.write().await.insert(stream_id, ConnRecord {
+                                        db_id:             db_id_val,
+                                        tunnel_id,
+                                        peer_ip:           peer.ip().to_string(),
+                                        bytes_in:          Arc::clone(&bytes_in),
+                                        bytes_out:         Arc::clone(&bytes_out),
+                                        bytes_in_per_sec:  Arc::clone(&bytes_in_ps),
+                                        bytes_out_per_sec: Arc::clone(&bytes_out_ps),
+                                        connected_at:      Instant::now(),
+                                        kill_tx,
+                                    });
                                     handle_player_stream(
                                         player_stream, stream_id, player_rx, wtx, st,
                                         bytes_in, bytes_out, kill_rx, reg,

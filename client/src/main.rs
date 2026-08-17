@@ -281,10 +281,12 @@ async fn main() -> Result<()> {
 async fn run_server_task(
     entry: ServerEntry,
     client_uuid: String,
+    client_id: String,
     manager_url: String,
     http_client: reqwest::Client,
     state: Arc<RwLock<ClientState>>,
     servers: Arc<RwLock<HashMap<u32, ServerConnection>>>,
+    server_entries: Vec<ServerEntry>,
     stats: Stats,
 ) {
     let server_id = entry.id;
@@ -363,6 +365,23 @@ async fn run_server_task(
                 servers.write().await.insert(entry.id, ServerConnection {
                     id: entry.id, name: entry.name.clone(), write_tx,
                 });
+
+                // Trigger an immediate tunnel sync so tunnels are opened on
+                // this server right away instead of waiting up to
+                // poll_interval_secs.  Without this there is a window after
+                // every reconnect where the TCP listener on the game port is
+                // down (it was closed when we disconnected) and the server
+                // is back up but has no tunnels yet — any Minecraft client
+                // pinging during that window gets no response and the green
+                // ping bar in the server list stays empty until the next
+                // regular poll fires.
+                if let Err(e) = sync_tunnels(
+                    &http_client, &manager_url,
+                    &state, &servers,
+                    &server_entries, &stats, &client_id,
+                ).await {
+                    error!("Initial tunnel sync after reconnect to '{}' failed: {:?}", entry.name, e);
+                }
 
                 let mut rh = read_half;
                 let idle_timeout = tokio::time::Duration::from_secs(SERVER_IDLE_TIMEOUT_SECS);
@@ -541,10 +560,12 @@ async fn run_client(config: ClientConfig) -> Result<()> {
                             let handle = tokio::spawn(run_server_task(
                                 entry,
                                 config_clone.client_uuid.clone(),
+                                config_clone.client_id.clone(),
                                 config_clone.manager_url.clone(),
                                 http_clone.clone(),
                                 Arc::clone(&state_clone),
                                 Arc::clone(&servers_clone),
+                                config_clone.servers.clone(),
                                 stats_clone.clone(),
                             ));
                             active.insert(sid, handle);
