@@ -316,8 +316,15 @@ async fn update_tunnel(State(state): State<Arc<AppState>>, Path(id): Path<u32>, 
 
     // Reset dns_set whenever a field that affects DNS is changed, so the
     // manager picks it up next cycle and re-sets the Cloudflare records.
+    // `remote_port` is included because it is stored in the SRV record; if
+    // the port changes but dns_set is not reset, the SRV continues to
+    // advertise the old port.  Minecraft server-list pings resolve the port
+    // via SRV, so they would connect to the stale port and receive no
+    // response — producing a permanent "Pinging…" indicator — while direct
+    // connections that specify the new port explicitly still succeed.
     let dns_reset = req.server_id.is_some() || req.subdomain.is_some()
-        || req.domain.is_some() || req.create_srv.is_some();
+        || req.domain.is_some() || req.create_srv.is_some()
+        || req.remote_port.is_some();
     if dns_reset { u.push("dns_set = FALSE"); }
 
     let sql = format!("UPDATE tunnels SET {} WHERE id = ?", u.join(", "));
