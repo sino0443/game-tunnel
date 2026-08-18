@@ -784,23 +784,12 @@ async fn sync_tunnels(
         stats.remove_tunnel(tunnel_id).await;
         let new_tid = TUNNEL_ID_COUNTER.fetch_add(1, Ordering::Relaxed);
         let local_addr = format!("{}:{}", dbt.server_ip, dbt.server_port);
-        {
-            let svrs = servers.read().await;
-            if let Some(srv) = svrs.get(new_sid) {
-                let _ = srv.write_tx.send(Frame::Control(Message::OpenTunnel {
-                    tunnel_id: new_tid,
-                    remote_port: dbt.remote_port,
-                    protocol: match dbt.protocol.as_str() {
-                        "udp" => TunnelProtocol::Udp,
-                        "both" => TunnelProtocol::Both,
-                        _ => TunnelProtocol::Tcp,
-                    },
-                    db_id: dbt.id,
-                })).await;
-            } else {
-                continue;
-            }
-        }
+        // Register state and stats BEFORE sending OpenTunnel so that any
+        // NewConnection arriving immediately after the server binds the port
+        // already finds the TunnelStats entry.  Without this ordering, the
+        // increment in handle_control_message(NewConnection) is silently
+        // skipped (stats not yet present), but the decrement still fires when
+        // the connection closes → u64 underflow → phantom u64::MAX counter.
         {
             let mut st = state.write().await;
             st.tunnels.insert(dbt.id, ActiveTunnel {
@@ -814,6 +803,35 @@ async fn sync_tunnels(
             st.tunnel_server.insert(new_tid, *new_sid);
         }
         stats.add_tunnel(new_tid, dbt.id, dbt.name.clone(), dbt.subdomain.clone()).await;
+        // Send OpenTunnel now that state and stats are ready.  On failure,
+        // roll back the state/stats additions so the next sync cycle sees the
+        // tunnel as absent and retries with a fresh tunnel_id.
+        let sent = {
+            let svrs = servers.read().await;
+            svrs.get(new_sid).map(|srv| {
+                srv.write_tx.try_send(Frame::Control(Message::OpenTunnel {
+                    tunnel_id: new_tid,
+                    remote_port: dbt.remote_port,
+                    protocol: match dbt.protocol.as_str() {
+                        "udp" => TunnelProtocol::Udp,
+                        "both" => TunnelProtocol::Both,
+                        _ => TunnelProtocol::Tcp,
+                    },
+                    db_id: dbt.id,
+                })).is_ok()
+            }).unwrap_or(false)
+        };
+        if !sent {
+            let mut st = state.write().await;
+            if let Some(t) = st.tunnels.remove(&dbt.id) {
+                st.tunnel_local_addrs.remove(&t.tunnel_id);
+                st.tunnel_server.remove(&t.tunnel_id);
+                st.tunnel_protocols.remove(&t.tunnel_id);
+                st.tunnel_proxy_protocol.remove(&t.tunnel_id);
+            }
+            stats.remove_tunnel(new_tid).await;
+            continue;
+        }
     }
 
     let tunnel_counts: HashMap<u32, usize> = {
@@ -843,21 +861,8 @@ async fn sync_tunnels(
             "Opening tunnel '{}' on server {}: port {} -> {}",
             dbt.subdomain, server_id, dbt.remote_port, local_address
         );
-        {
-            let svrs = servers.read().await;
-            if let Some(srv) = svrs.get(&server_id) {
-                if srv.write_tx.send(Frame::Control(Message::OpenTunnel {
-                    tunnel_id,
-                    remote_port: dbt.remote_port,
-                    protocol: match dbt.protocol.as_str() {
-                        "udp" => TunnelProtocol::Udp,
-                        "both" => TunnelProtocol::Both,
-                        _ => TunnelProtocol::Tcp,
-                    },
-                    db_id: dbt.id,
-                })).await.is_err() { continue; }
-            } else { continue; }
-        }
+        // Register state and stats BEFORE sending OpenTunnel — same ordering
+        // fix as the to_update path above to prevent phantom active_connections.
         {
             let mut st = state.write().await;
             st.tunnels.insert(dbt.id, ActiveTunnel {
@@ -871,6 +876,32 @@ async fn sync_tunnels(
             st.tunnel_server.insert(tunnel_id, server_id);
         }
         stats.add_tunnel(tunnel_id, dbt.id, dbt.name.clone(), dbt.subdomain.clone()).await;
+        let sent = {
+            let svrs = servers.read().await;
+            svrs.get(&server_id).map(|srv| {
+                srv.write_tx.try_send(Frame::Control(Message::OpenTunnel {
+                    tunnel_id,
+                    remote_port: dbt.remote_port,
+                    protocol: match dbt.protocol.as_str() {
+                        "udp" => TunnelProtocol::Udp,
+                        "both" => TunnelProtocol::Both,
+                        _ => TunnelProtocol::Tcp,
+                    },
+                    db_id: dbt.id,
+                })).is_ok()
+            }).unwrap_or(false)
+        };
+        if !sent {
+            let mut st = state.write().await;
+            if let Some(t) = st.tunnels.remove(&dbt.id) {
+                st.tunnel_local_addrs.remove(&t.tunnel_id);
+                st.tunnel_server.remove(&t.tunnel_id);
+                st.tunnel_protocols.remove(&t.tunnel_id);
+                st.tunnel_proxy_protocol.remove(&t.tunnel_id);
+            }
+            stats.remove_tunnel(tunnel_id).await;
+            continue;
+        }
     }
     Ok(())
 }
@@ -990,7 +1021,7 @@ async fn handle_server_frame(
             if let Some(tid) = st.stream_tunnel.remove(&stream_id) {
                 let t = stats.tunnels.read().await;
                 if let Some(ts) = t.get(&tid) {
-                    ts.active_connections.fetch_sub(1, Ordering::Relaxed);
+                    ts.saturating_decrement_active();
                 }
             }
         }
@@ -1058,7 +1089,7 @@ async fn handle_control_message(
                             info!("UDP stream {}: socket bound, connecting to {}", stream_id, local_addr_clone);
                             if socket.connect(&local_addr_clone).await.is_err() {
                                 warn!("UDP stream {}: connect to {} failed", stream_id, local_addr_clone);
-                                { let t = stats_clone.tunnels.read().await; if let Some(ts) = t.get(&tunnel_id) { ts.active_connections.fetch_sub(1, Ordering::Relaxed); } }
+                                { let t = stats_clone.tunnels.read().await; if let Some(ts) = t.get(&tunnel_id) { ts.saturating_decrement_active(); } }
                                 let mut st = state_clone.write().await;
                                 st.streams.remove(&stream_id);
                                 st.stream_tunnel.remove(&stream_id);
@@ -1071,7 +1102,7 @@ async fn handle_control_message(
                         }
                         Err(e) => {
                             error!("UDP stream {}: bind failed: {:?}", stream_id, e);
-                            { let t = stats_clone.tunnels.read().await; if let Some(ts) = t.get(&tunnel_id) { ts.active_connections.fetch_sub(1, Ordering::Relaxed); } }
+                            { let t = stats_clone.tunnels.read().await; if let Some(ts) = t.get(&tunnel_id) { ts.saturating_decrement_active(); } }
                             let mut st = state_clone.write().await;
                             st.streams.remove(&stream_id);
                             st.stream_tunnel.remove(&stream_id);
@@ -1115,7 +1146,7 @@ async fn handle_control_message(
                         }
                         Err(e) => {
                             error!("Connect error to {}: {:?}", local_addr, e);
-                            { let t = stats_clone.tunnels.read().await; if let Some(ts) = t.get(&tunnel_id) { ts.active_connections.fetch_sub(1, Ordering::Relaxed); } }
+                            { let t = stats_clone.tunnels.read().await; if let Some(ts) = t.get(&tunnel_id) { ts.saturating_decrement_active(); } }
                             let mut st = state_clone.write().await;
                             st.streams.remove(&stream_id);
                             st.stream_tunnel.remove(&stream_id);
@@ -1203,7 +1234,7 @@ async fn handle_local_stream(
     st.streams.remove(&stream_id);
     if st.stream_tunnel.remove(&stream_id).is_some() {
         let t = stats.tunnels.read().await;
-        if let Some(ts) = t.get(&tunnel_id) { ts.active_connections.fetch_sub(1, Ordering::Relaxed); }
+        if let Some(ts) = t.get(&tunnel_id) { ts.saturating_decrement_active(); }
     }
 }
 
@@ -1286,6 +1317,6 @@ async fn handle_local_udp_stream(
     st.streams.remove(&stream_id);
     if st.stream_tunnel.remove(&stream_id).is_some() {
         let t = stats.tunnels.read().await;
-        if let Some(ts) = t.get(&tunnel_id) { ts.active_connections.fetch_sub(1, Ordering::Relaxed); }
+        if let Some(ts) = t.get(&tunnel_id) { ts.saturating_decrement_active(); }
     }
 }

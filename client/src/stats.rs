@@ -121,6 +121,22 @@ impl Stats {
         self.tunnels.write().await.remove(&tunnel_id);
     }
 
+    /// Decrements `active_connections` by 1, saturating at 0.
+    ///
+    /// Plain `fetch_sub(1)` on a zero value wraps around to `u64::MAX`, which
+    /// causes the tunnel to appear permanently active in the dashboard.  This
+    /// can happen when a `NewConnection` message arrives before `add_tunnel`
+    /// has been called (the increment is silently skipped) but the connection
+    /// later closes and triggers the decrement.  Using saturating subtraction
+    /// as a defence-in-depth measure keeps the counter at 0 in that case.
+    pub fn saturating_decrement_active(&self) {
+        // CAS loop: read current value, subtract 1 (clamped to 0), write back.
+        // Uses `fetch_update` which retries automatically on contention.
+        self.active_connections
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| v.checked_sub(1))
+            .ok(); // `Err` means value was already 0 — that's fine, nothing to do.
+    }
+
     /// Sekundenraten für alle Tunnel aktualisieren.
     /// Muss jede Sekunde aufgerufen werden.
     pub async fn tick_rates(&self) {
