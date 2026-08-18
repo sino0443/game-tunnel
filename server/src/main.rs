@@ -652,12 +652,33 @@ async fn handle_control_message(
 
             if protocol == TunnelProtocol::Tcp || protocol == TunnelProtocol::Both {
                 let addr_str = format!("{}:{}", bind_addr, remote_port);
-                let listener = match TcpListener::bind(&addr_str).await {
-                    Ok(l) => l,
-                    Err(e) => {
-                        error!("Failed to bind port {}: {:?}", remote_port, e);
-                        let _ = write_tx.send(Frame::Control(Message::CloseTunnel { tunnel_id })).await;
-                        return Ok(());
+                // Retry binding the port up to 10 times (500 ms total) if it is still in use.
+                // This handles the race window where a previous `CloseTunnel` just fired the
+                // shutdown signal for the old listener task, but the task has not yet dropped
+                // its `TcpListener` and released the port.  On a healthy system this resolves
+                // within one or two 50 ms ticks; other `bind` errors (e.g. permission denied)
+                // are propagated immediately without retrying.
+                let listener = {
+                    let mut result = None;
+                    for attempt in 0u8..10 {
+                        match TcpListener::bind(&addr_str).await {
+                            Ok(l) => { result = Some(Ok(l)); break; }
+                            Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
+                                if attempt == 0 {
+                                    warn!("Port {} still in use (previous listener shutting down?), retrying…", remote_port);
+                                }
+                                tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+                            }
+                            Err(e) => { result = Some(Err(e)); break; }
+                        }
+                    }
+                    match result.unwrap_or_else(|| Err(std::io::Error::new(std::io::ErrorKind::AddrInUse, "port still in use after retries"))) {
+                        Ok(l) => l,
+                        Err(e) => {
+                            error!("Failed to bind port {}: {:?}", remote_port, e);
+                            let _ = write_tx.send(Frame::Control(Message::CloseTunnel { tunnel_id })).await;
+                            return Ok(());
+                        }
                     }
                 };
                 info!("Listening on {} (TCP)", addr_str);
@@ -723,27 +744,45 @@ async fn handle_control_message(
 
             if protocol == TunnelProtocol::Udp || protocol == TunnelProtocol::Both {
                 let addr_str = format!("{}:{}", bind_addr, remote_port);
-                let socket = match UdpSocket::bind(&addr_str).await {
-                    Ok(s) => {
-                        // Default kernel UDP buffers (often ~200 KB or less) are too
-                        // small once one socket multiplexes many players' bursty
-                        // traffic (Rust, ARK, Valheim, Minecraft Bedrock/RakNet, ...);
-                        // packets get dropped by the kernel before our code ever
-                        // sees them. Size generously — this is one socket shared by
-                        // every player on this tunnel, not a per-player buffer.
-                        let sock_ref = socket2::SockRef::from(&s);
-                        if let Err(e) = sock_ref.set_recv_buffer_size(UDP_SOCKET_BUF_SIZE) {
-                            warn!("Failed to set UDP SO_RCVBUF for port {}: {:?}", remote_port, e);
+                // Same retry logic as the TCP path above — guard against the brief
+                // window where a previous UDP socket for this port has not yet been
+                // dropped by its listener task after a CloseTunnel / reconnect.
+                let socket = {
+                    let mut result: Option<Result<UdpSocket, std::io::Error>> = None;
+                    for attempt in 0u8..10 {
+                        match UdpSocket::bind(&addr_str).await {
+                            Ok(s) => { result = Some(Ok(s)); break; }
+                            Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
+                                if attempt == 0 {
+                                    warn!("UDP port {} still in use, retrying…", remote_port);
+                                }
+                                tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+                            }
+                            Err(e) => { result = Some(Err(e)); break; }
                         }
-                        if let Err(e) = sock_ref.set_send_buffer_size(UDP_SOCKET_BUF_SIZE) {
-                            warn!("Failed to set UDP SO_SNDBUF for port {}: {:?}", remote_port, e);
-                        }
-                        Arc::new(s)
                     }
-                    Err(e) => {
-                        error!("Failed to bind UDP port {}: {:?}", remote_port, e);
-                        let _ = write_tx.send(Frame::Control(Message::CloseTunnel { tunnel_id })).await;
-                        return Ok(());
+                    match result.unwrap_or_else(|| Err(std::io::Error::new(std::io::ErrorKind::AddrInUse, "UDP port still in use after retries"))) {
+                        Ok(s) => {
+                            // Default kernel UDP buffers (often ~200 KB or less) are too
+                            // small once one socket multiplexes many players' bursty
+                            // traffic (Rust, ARK, Valheim, Minecraft Bedrock/RakNet, ...);
+                            // packets get dropped by the kernel before our code ever
+                            // sees them. Size generously — this is one socket shared by
+                            // every player on this tunnel, not a per-player buffer.
+                            let sock_ref = socket2::SockRef::from(&s);
+                            if let Err(e) = sock_ref.set_recv_buffer_size(UDP_SOCKET_BUF_SIZE) {
+                                warn!("Failed to set UDP SO_RCVBUF for port {}: {:?}", remote_port, e);
+                            }
+                            if let Err(e) = sock_ref.set_send_buffer_size(UDP_SOCKET_BUF_SIZE) {
+                                warn!("Failed to set UDP SO_SNDBUF for port {}: {:?}", remote_port, e);
+                            }
+                            Arc::new(s)
+                        }
+                        Err(e) => {
+                            error!("Failed to bind UDP port {}: {:?}", remote_port, e);
+                            let _ = write_tx.send(Frame::Control(Message::CloseTunnel { tunnel_id })).await;
+                            return Ok(());
+                        }
                     }
                 };
                 info!("Listening on {} (UDP)", addr_str);
