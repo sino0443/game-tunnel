@@ -41,6 +41,9 @@ struct ActiveTunnel {
     #[allow(dead_code)] db_id: u32,
     #[allow(dead_code)] remote_port: u16,
     #[allow(dead_code)] local_address: String,
+    /// Cached value so sync_tunnels can detect proxy_protocol changes without
+    /// requiring a client restart.
+    proxy_protocol: bool,
 }
 
 struct LocalStream { tx: mpsc::Sender<Vec<u8>> }
@@ -702,12 +705,15 @@ async fn sync_tunnels(
         let mut update: Vec<(DbTunnel, u32, u32)> = Vec::new();
         for dbt in &db_tunnels {
             if let Some(current) = current_ids.get(&dbt.id) {
-                if let Some(desired_sid) = dbt.server_id {
-                    if server_entries.iter().any(|s| s.id == desired_sid)
-                        && desired_sid != current.server_id
-                    {
-                        update.push((dbt.clone(), current.server_id, desired_sid));
-                    }
+                // Use the current server when the manager hasn't assigned one yet.
+                let desired_sid = dbt.server_id.unwrap_or(current.server_id);
+                let server_known = server_entries.iter().any(|s| s.id == desired_sid);
+                let server_changed = desired_sid != current.server_id;
+                // Detect proxy_protocol toggle so the change takes effect without
+                // a client restart: close and reopen the tunnel on the same server.
+                let pp_changed = dbt.proxy_protocol != current.proxy_protocol;
+                if server_known && (server_changed || pp_changed) {
+                    update.push((dbt.clone(), current.server_id, desired_sid));
                 }
             } else {
                 add.push(dbt.clone());
@@ -800,6 +806,7 @@ async fn sync_tunnels(
             st.tunnels.insert(dbt.id, ActiveTunnel {
                 tunnel_id: new_tid, server_id: *new_sid, db_id: dbt.id,
                 remote_port: dbt.remote_port, local_address: local_addr.clone(),
+                proxy_protocol: dbt.proxy_protocol,
             });
             st.tunnel_local_addrs.insert(new_tid, local_addr);
             st.tunnel_protocols.insert(new_tid, dbt.protocol.clone());
@@ -856,6 +863,7 @@ async fn sync_tunnels(
             st.tunnels.insert(dbt.id, ActiveTunnel {
                 tunnel_id, server_id, db_id: dbt.id,
                 remote_port: dbt.remote_port, local_address: local_address.clone(),
+                proxy_protocol: dbt.proxy_protocol,
             });
             st.tunnel_local_addrs.insert(tunnel_id, local_address);
             st.tunnel_protocols.insert(tunnel_id, dbt.protocol.clone());
